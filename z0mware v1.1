@@ -1,22 +1,24 @@
 --[[
     ╔══════════════════════════════════════════════════════════╗
-    ║               z0mware  —  Blade Ball  v1.0               ║
+    ║               z0mware  —  Blade Ball  v1.1               ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  Fixes over original NoEnemies Hub v7.2:                 ║
-    ║   • Double-parry fix: hasParried flag, resets only on    ║
-    ║     real target change — no more phantom 2nd parry       ║
-    ║   • currentBall forward-declared BEFORE StartAntiCurve   ║
-    ║     (silent nil-upvalue crash on many executors fixed)   ║
-    ║   • local Main forward-declared before ToggleBtn so      ║
-    ║     click handler can reference it without nil error     ║
-    ║   • AntiCurve block runs AFTER parry logic in loop       ║
-    ║   • Tuned threshold: base 0.155, one-way ping /2000      ║
-    ║   • PARRY_LOCKOUT 0.15 → 0.06 (only for TB suppression) ║
-    ║   • New z0mware UI: electric-blue accent, cleaner look   ║
-    ║   • Floating ⚡ menu button (drag or tap) for PC+mobile  ║
-    ║   • Mobile floating TB toggle button (bottom-left)       ║
-    ║     Always visible, draggable, toggles triggerbot        ║
-    ║   • All __NEH_ globals renamed to __Z0M_                 ║
+    ║  Fixes over v1.0:                                        ║
+    ║   • AERO FIX: frame-to-frame spike detection replaces    ║
+    ║     drifting baseline (no more false trigger after       ║
+    ║     15-20 hits as ball naturally speeds up)              ║
+    ║   • aeroPrevSpd tracks last-frame speed; spike only      ║
+    ║     fires when spd > prevSpd * AERO_SPIKE_MULT in        ║
+    ║     a single step — genuine aero slash only              ║
+    ║   • AeroThreshBoost default lowered 60 → 35 ms           ║
+    ║   • DRAG FIX PC: MakeDraggable now uses                  ║
+    ║     UserInputService.InputChanged globally so the        ║
+    ║     panel doesn't freeze when mouse leaves header        ║
+    ║   • DRAG FIX MOBILE: ToggleBtn & MobileTBBtn use         ║
+    ║     UIS.InputEnded for tap detection — no more           ║
+    ║     "moved" flag staying true after first drag,          ║
+    ║     ⚡ button now reliably toggles menu on mobile        ║
+    ║   • isMobile: added GuiService.TouchControlsEnabled      ║
+    ║     as secondary check for edge-case tablets             ║
     ╚══════════════════════════════════════════════════════════╝
 --]]
 
@@ -27,16 +29,16 @@ local TweenService        = game:GetService("TweenService")
 local UserInputService    = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local HttpService         = game:GetService("HttpService")
+local GuiService          = game:GetService("GuiService")
 local Camera              = workspace.CurrentCamera
 
 local LP         = Players.LocalPlayer
 local BallFolder = workspace:WaitForChild("Balls", 15)
 
 -- ══════════════════════════════════ Mobile detect ══
--- TouchEnabled is the only reliable mobile signal on Roblox.
--- KeyboardEnabled is true even on phones (Roblox virtual keyboard), so we
--- do NOT check it — that check made isMobile always false on real devices.
-local isMobile = UserInputService.TouchEnabled
+-- Primary: TouchEnabled. Secondary: GuiService.TouchControlsEnabled
+-- We intentionally do NOT check KeyboardEnabled (true even on phones).
+local isMobile = UserInputService.TouchEnabled or GuiService.TouchControlsEnabled
 
 -- Kill old instances
 do
@@ -79,42 +81,55 @@ local S = {
     MenuKey        = Enum.KeyCode.RightControl,
 }
 
--- Extra detection settings (added alongside S table)
-S.AeroDetect      = true   -- detect Aerodynamic Slash speed spikes
-S.AeroThreshBoost = 60     -- how much extra threshold (ms) to add when aero detected
-S.AeroDecay       = 1.2    -- seconds after which aero boost expires
+S.AeroDetect      = true
+S.AeroThreshBoost = 35     -- FIX v1.1: lowered from 60 → 35 ms (less aggressive early fire)
+S.AeroDecay       = 1.2
 
 local _conns = {}
 local function Track(c) _conns[#_conns+1]=c; return c end
 
 -- ══════════════════════════════ AERO SLASH DETECTION ══
--- Aerodynamic Slash causes a sudden sharp speed increase on the ball
--- after a hit. We track the rolling max speed and flag a spike when
--- current speed exceeds baselineMax * AeroSpikeMultiplier.
--- While flagged, GetThreshold() adds AeroThreshBoost so we fire earlier.
+-- FIX v1.1: Replaced drifting-baseline approach with frame-to-frame spike detection.
+-- Old code used aeroBaselineSpd with a spd*0.6 floor — after 15-20 parries the
+-- ball's naturally-risen speed made the baseline drift up, then any small wobble
+-- crossed the 1.40× threshold and permanently added 60 ms of threshold boost,
+-- causing the parry to fire visibly early.
+-- New approach: compare CURRENT frame speed vs PREVIOUS frame speed.
+-- A genuine Aerodynamic Slash causes an instantaneous jump (40%+ in one frame).
+-- Normal ball acceleration is gradual and never trips this.
+local AERO_SPIKE_MULT  = 1.40   -- 40% faster than LAST FRAME = aero slash
 local aeroDetected     = false
 local aeroExpiry       = 0
-local aeroBaselineSpd  = 0   -- smoothed "normal" ball speed this round
-local aeroPeakSpd      = 0   -- highest observed speed this round
-local AERO_SPIKE_MULT  = 1.40 -- 40% faster than baseline = aero slash
-local aeroLastReset    = 0
+local aeroPrevSpd      = 0      -- FIX: replaces drifting baseline
+local aeroBaselineSpd  = 0      -- kept for display only (Detect tab)
+local aeroPeakSpd      = 0      -- kept for display only
+
 local function UpdateAero(ball)
     if not S.AeroDetect then aeroDetected=false; return end
     local z=ball:FindFirstChild("zoomies"); if not z then return end
-    local spd=z.VectorVelocity.Magnitude; if spd<2 then return end
+    local spd=z.VectorVelocity.Magnitude
+    if spd < 5 then aeroPrevSpd=spd; return end
+
     local now=tick()
-    -- Slowly raise the baseline (tracks the "normal" speed of this ball)
-    aeroBaselineSpd=math.max(aeroBaselineSpd+0.08*(spd-aeroBaselineSpd), spd*0.6)
-    if spd>aeroPeakSpd then aeroPeakSpd=spd end
-    -- Spike check: speed jumped well above what we've seen as baseline
-    if aeroBaselineSpd>5 and spd >= aeroBaselineSpd*AERO_SPIKE_MULT then
+
+    -- Update display values (not used for detection logic)
+    aeroBaselineSpd = aeroBaselineSpd + 0.04*(spd-aeroBaselineSpd)
+    if spd > aeroPeakSpd then aeroPeakSpd=spd end
+
+    -- FIX: Spike detection — genuine aero slash causes an instant per-frame jump.
+    -- aeroPrevSpd must be meaningful (> 10) to avoid false triggers on ball spawn.
+    if aeroPrevSpd > 10 and spd >= aeroPrevSpd * AERO_SPIKE_MULT then
         aeroDetected=true; aeroExpiry=now+S.AeroDecay
     end
-    -- Expire
-    if aeroDetected and now>=aeroExpiry then aeroDetected=false end
+    aeroPrevSpd = spd
+
+    -- Expire detection after AeroDecay seconds
+    if aeroDetected and now >= aeroExpiry then aeroDetected=false end
 end
+
 local function ResetAeroRound()
     aeroDetected=false; aeroBaselineSpd=0; aeroPeakSpd=0; aeroExpiry=0
+    aeroPrevSpd=0   -- FIX: also reset frame-tracking var
 end
 
 -- ══════════════════════════════════ FPS / Jitter ══
@@ -142,14 +157,11 @@ local function UpdatePing()
 end
 
 -- ── Threshold ────────────────────────────────────────────────────
--- FIX: base 0.20→0.155, one-way ping /2000 cap 0.04
 local function GetThreshold()
     local base = S.AutoTiming and 0.155 or S.TriggerTime
     local pingC = math.clamp(smoothPing / 2000, 0, 0.04)
     local fpsC  = fpsLow and math.clamp((60-smoothFPS)/60*0.04, 0, 0.04) or 0
     local jitC  = math.clamp(math.sqrt(dtVar)*1.5, 0, 0.025)
-    -- When Aerodynamic Slash is detected the ball is faster, so we need
-    -- to fire earlier — add AeroThreshBoost on top of the base threshold.
     local aeroC = (aeroDetected and S.AeroDetect) and S.AeroThreshBoost/1000 or 0
     return base + pingC + fpsC + jitC + aeroC
 end
@@ -215,17 +227,15 @@ local function DoAutoCurve()
     acCamRestoring=true; task.delay(S.ACSnapDur,function() acCamRestoring=false end)
 end
 
--- ═══════════════════ CORE PARRY VARS (MUST be before StartAntiCurve) ══
--- FIX: these were declared AFTER StartAntiCurve in the original, causing a
--- nil-upvalue crash on executors that don't hoist locals across function bodies.
+-- ═══════════════════ CORE PARRY VARS ══
 local cachedHRP    = nil
-local currentBall  = nil   -- used by StartAntiCurve below
+local currentBall  = nil
 local ballConn     = nil
 local fireCount    = 0
 local inWindow     = false
-local hasParried   = false -- NEW: true once we fired this target cycle; reset on target change
+local hasParried   = false
 local lastParryTime= 0
-local PARRY_LOCKOUT= 0.06  -- FIX: 0.15→0.06 (only used to suppress TB double-fire)
+local PARRY_LOCKOUT= 0.06
 local cpsFireBucket=0; local cpsActual=0; local cpsMeasTimer=0
 
 -- ══════════════════════════════ ANTI CURVE ENGINE ══
@@ -319,7 +329,6 @@ local function BindBall(ball)
     currentBall=ball; fireCount=0; inWindow=false; hasParried=false; lastParryTime=0; CurveClear(); ResetAeroRound()
     if not ball then return end
     ballConn=ball:GetAttributeChangedSignal("target"):Connect(function()
-        -- Real target change: fresh parry window, reset hasParried so we fire again
         fireCount=0; inWindow=false; hasParried=false
     end)
 end
@@ -381,12 +390,6 @@ Track(RunService.PreSimulation:Connect(function(dt)
     local dist= (hrp.Position-ball.Position).Magnitude
 
     if dist<1.5 then return end
-
-    -- ── DOUBLE-PARRY GUARD ──────────────────────────────────────
-    -- hasParried is set true after we fire. It only resets when the
-    -- ball.target attribute changes (new round / new player targeted).
-    -- This prevents firing again when the ball velocity takes 2-4 frames
-    -- to flip direction on the client side after a successful parry.
     if hasParried then return end
 
     if not IsApproaching(ball,hrp) then
@@ -405,16 +408,12 @@ Track(RunService.PreSimulation:Connect(function(dt)
 
     if tti<=threshold and fireCount<S.MaxFires then
         inWindow=true; fireCount+=1; FireParry()
-        -- Lock immediately after the FIRST fire.
-        -- MaxFires is irrelevant here — one parry per round is all the server
-        -- accepts. Without this, the very next frame (ball still in-window)
-        -- would fire again before the ball's reversed velocity reaches the client.
         hasParried=true
     elseif inWindow and tti>threshold+0.05 then
         inWindow=false; fireCount=0
     end
 
-    -- ── AntiCurve AFTER parry logic (FIX: was before, polluted TTI reads) ──
+    -- AntiCurve AFTER parry logic
     if antiCurveActive then
         if tick()>=antiCurveExpiry then
             antiCurveActive=false; antiCurveDir=nil
@@ -600,7 +599,7 @@ ScreenGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 ScreenGui.IgnoreGuiInset=true
 ScreenGui.Parent=GuiParent()
 
--- ── Color palette — electric blue accent ──────────────────────
+-- ── Color palette ──────────────────────────────────────────────
 local C={
     bg=Color3.fromRGB(6,7,12),
     panel=Color3.fromRGB(13,14,22),
@@ -608,8 +607,8 @@ local C={
     tabBar=Color3.fromRGB(8,9,15),
     tabBtn=Color3.fromRGB(16,17,28),
     tabSel=Color3.fromRGB(18,24,44),
-    accent=Color3.fromRGB(80,190,255),    -- electric blue
-    accent2=Color3.fromRGB(110,65,230),   -- purple
+    accent=Color3.fromRGB(80,190,255),
+    accent2=Color3.fromRGB(110,65,230),
     green=Color3.fromRGB(55,205,85),
     red=Color3.fromRGB(255,60,60),
     blue=Color3.fromRGB(75,185,255),
@@ -633,12 +632,48 @@ local TAB_H   = isMobile and 36 or 30
 local CONTENT_TOP = HEADER_H + TAB_H
 
 -- ════════════════════════════ FORWARD-DECLARE Main ══
--- FIX: Main must be declared before the toggle button's click
--- handler, otherwise the handler captures nil and errors on first tap.
 local Main
 
+-- ════════════════════════════ DRAG HELPER ══
+-- FIX v1.1: All draggable elements now use UserInputService.InputChanged globally.
+-- The old approach (handle.InputChanged) only fired while the cursor/finger stayed
+-- physically over the GuiObject — moving quickly off the header instantly dropped
+-- the drag on PC, and touch events on mobile were lost whenever the button moved
+-- out from under the touch point.
+local function MakeDraggable(frame, handle)
+    handle = handle or frame
+    local dragging   = false
+    local dragStart, startPos
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        dragging  = true
+        dragStart = input.Position
+        startPos  = frame.Position
+    end)
+
+    -- Global: fires regardless of where the cursor/finger currently is
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local d = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
 -- ════════════════════════════ FLOATING MENU BUTTON ══
--- Tap/click to toggle the menu. Draggable. Always on top.
 local ToggleBtn=Instance.new("TextButton",ScreenGui)
 ToggleBtn.Name="Z0M_ToggleBtn"
 ToggleBtn.Size=UDim2.new(0,52,0,52)
@@ -656,39 +691,58 @@ Instance.new("UICorner",ToggleBtn).CornerRadius=UDim.new(1,0)
 local _tSt=Instance.new("UIStroke",ToggleBtn)
 _tSt.Color=C.accent2; _tSt.Thickness=1.5; _tSt.Transparency=0.3
 
-do  -- draggable toggle btn
-    local activeInput = nil
+do
+    -- FIX v1.1: Replaced element-local InputChanged (unreliable once button moves)
+    -- with UIS global events. Tap detection uses InputBegan position vs InputEnded
+    -- position — works on both PC and mobile, and doesn't break after first drag.
+    local dragging   = false
     local dragStart, startPos
-    local moved = false
+    local tapOrigin  = nil   -- position where the press started
+
     ToggleBtn.InputBegan:Connect(function(input)
-        if activeInput then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        activeInput = input; dragStart = input.Position; startPos = ToggleBtn.Position; moved = false
+        if dragging then return end
+        dragging   = true
+        dragStart  = input.Position
+        startPos   = ToggleBtn.Position
+        tapOrigin  = input.Position
     end)
-    ToggleBtn.InputChanged:Connect(function(input)
-        if input ~= activeInput then return end
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
         local d = input.Position - dragStart
-        if d.Magnitude > 12 then moved = true end   -- 12px: above touch jitter, below intentional drag
-        ToggleBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+        ToggleBtn.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
     end)
-    ToggleBtn.InputEnded:Connect(function(input)
-        if input == activeInput then activeInput = nil end
-    end)
-    ToggleBtn.MouseButton1Click:Connect(function()
-        if moved then return end
-        if Main then
-            Main.Visible = not Main.Visible
-            TweenService:Create(ToggleBtn, TweenInfo.new(0.12), {
-                BackgroundColor3 = Main.Visible and Color3.fromRGB(18,20,42) or Color3.fromRGB(10,11,20)
-            }):Play()
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if not dragging then return end
+
+        -- Tap detection: finger/cursor didn't travel more than 18px = intentional tap
+        if tapOrigin and (input.Position - tapOrigin).Magnitude < 18 then
+            if Main then
+                Main.Visible = not Main.Visible
+                TweenService:Create(ToggleBtn, TweenInfo.new(0.12), {
+                    BackgroundColor3 = Main.Visible
+                        and Color3.fromRGB(18,20,42)
+                        or  Color3.fromRGB(10,11,20)
+                }):Play()
+            end
         end
+
+        dragging  = false
+        tapOrigin = nil
     end)
 end
 
 -- ════════════════════════ MOBILE TRIGGERBOT BUTTON ══
--- Only shown on mobile. Floating, draggable. Green = active, Red = off.
--- This is a SEPARATE button from the menu button — always visible.
 local MobileTBBtn = nil
 if isMobile then
     MobileTBBtn=Instance.new("TextButton",ScreenGui)
@@ -722,36 +776,52 @@ if isMobile then
     end
     _G.__Z0M_RefreshMobileTB=RefreshMobileTB
 
-    do  -- draggable mobile TB btn
-        local activeInput = nil
+    do
+        -- FIX v1.1: same UIS-global drag + tap pattern as ToggleBtn
+        local dragging  = false
         local dragStart, startPos
-        local moved = false
+        local tapOrigin = nil
+
         MobileTBBtn.InputBegan:Connect(function(input)
-            if activeInput then return end
             if input.UserInputType ~= Enum.UserInputType.MouseButton1
                 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-            activeInput = input; dragStart = input.Position; startPos = MobileTBBtn.Position; moved = false
+            if dragging then return end
+            dragging   = true
+            dragStart  = input.Position
+            startPos   = MobileTBBtn.Position
+            tapOrigin  = input.Position
         end)
-        MobileTBBtn.InputChanged:Connect(function(input)
-            if input ~= activeInput then return end
+
+        UserInputService.InputChanged:Connect(function(input)
+            if not dragging then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseMovement
+                and input.UserInputType ~= Enum.UserInputType.Touch then return end
             local d = input.Position - dragStart
-            if d.Magnitude > 12 then moved = true end
-            MobileTBBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+            MobileTBBtn.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
         end)
-        MobileTBBtn.InputEnded:Connect(function(input)
-            if input == activeInput then activeInput = nil end
-        end)
-        MobileTBBtn.MouseButton1Click:Connect(function()
-            if moved then return end
-            if not S.TBEnabled then return end
-            if tbActive then DeactivateTriggerbot() else ActivateTriggerbot() end
-            RefreshMobileTB()
+
+        UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            if not dragging then return end
+
+            if tapOrigin and (input.Position - tapOrigin).Magnitude < 18 then
+                if S.TBEnabled then
+                    if tbActive then DeactivateTriggerbot() else ActivateTriggerbot() end
+                    RefreshMobileTB()
+                end
+            end
+
+            dragging  = false
+            tapOrigin = nil
         end)
     end
 end
 
 -- ════════════════════════════════════ MAIN PANEL ══
--- FIX: assignment to the forward-declared local `Main`
 Main=Instance.new("Frame",ScreenGui)
 Main.Name="MainPanel"
 Main.Size=UDim2.new(0,W,0,H_FULL)
@@ -765,7 +835,6 @@ Main.ZIndex=10
 Instance.new("UICorner",Main).CornerRadius=UDim.new(0,10)
 local _ms=Instance.new("UIStroke",Main); _ms.Color=C.accent2; _ms.Thickness=1; _ms.Transparency=0.4
 
--- Gradient accent bar
 local AccBar=Instance.new("Frame",Main); AccBar.Size=UDim2.new(0,3,1,0); AccBar.BorderSizePixel=0; AccBar.ZIndex=4
 local _ag=Instance.new("UIGradient",AccBar)
 _ag.Color=ColorSequence.new({
@@ -775,7 +844,6 @@ _ag.Color=ColorSequence.new({
     ColorSequenceKeypoint.new(1,Color3.fromRGB(255,60,60))
 }); _ag.Rotation=90
 
--- Header
 local Header=Instance.new("Frame",Main)
 Header.Name="Header"; Header.Size=UDim2.new(1,0,0,HEADER_H)
 Header.BackgroundColor3=C.header; Header.BorderSizePixel=0; Header.ZIndex=3
@@ -798,7 +866,6 @@ CloseBtn.BackgroundColor3=Color3.fromRGB(160,28,28); CloseBtn.BorderSizePixel=0;
 CloseBtn.TextSize=14; CloseBtn.TextColor3=Color3.new(1,1,1); CloseBtn.Text="✕"; CloseBtn.AutoButtonColor=false; CloseBtn.ZIndex=5
 Instance.new("UICorner",CloseBtn).CornerRadius=UDim.new(0,6)
 
--- Tab bar
 local TabBar=Instance.new("Frame",Main)
 TabBar.Name="TabBar"; TabBar.Size=UDim2.new(1,0,0,TAB_H); TabBar.Position=UDim2.new(0,0,0,HEADER_H)
 TabBar.BackgroundColor3=C.tabBar; TabBar.BorderSizePixel=0; TabBar.ZIndex=3
@@ -806,35 +873,7 @@ local _tbl=Instance.new("UIListLayout",TabBar)
 _tbl.FillDirection=Enum.FillDirection.Horizontal; _tbl.HorizontalAlignment=Enum.HorizontalAlignment.Left
 _tbl.SortOrder=Enum.SortOrder.LayoutOrder
 
--- ── Drag helper ──────────────────────────────────────────────────
-local function MakeDraggable(frame, handle)
-    handle = handle or frame
-    local activeInput = nil
-    local dragStart, startPos
-    -- Use handle.InputChanged (fires ONLY for inputs that began on this element)
-    -- instead of global UserInputService.InputChanged (fires for ALL touches).
-    -- This prevents a second finger anywhere on screen from teleporting the window.
-    handle.InputBegan:Connect(function(input)
-        if activeInput then return end  -- ignore second finger
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        activeInput = input
-        dragStart   = input.Position
-        startPos    = frame.Position
-    end)
-    handle.InputChanged:Connect(function(input)
-        if input ~= activeInput then return end
-        local d = input.Position - dragStart
-        frame.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + d.X,
-            startPos.Y.Scale, startPos.Y.Offset + d.Y
-        )
-    end)
-    handle.InputEnded:Connect(function(input)
-        if input == activeInput then activeInput = nil end
-    end)
-end
-MakeDraggable(Main,Header)
+MakeDraggable(Main, Header)
 
 -- ── Widget helpers ───────────────────────────────────────────────
 local sliderRefs={}
@@ -885,7 +924,6 @@ local function MakeSlider(p,label,key,minV,maxV,fmt,lockWhen,order)
     local function UpdLbl(val) Lbl.TextColor3=Locked() and C.subtext or C.text; Lbl.Text=label..":  "..string.format(fmt,val)..(Locked() and "  [AUTO]" or "") end
     UpdLbl(S[key])
     local trackH=isMobile and 10 or 5
-    -- Tap hit area: full-width strip above track so finger doesn't need to be precise
     local TrHit=Instance.new("TextButton",Row); TrHit.Size=UDim2.new(0.86,0,0,isMobile and 32 or 20); TrHit.Position=UDim2.new(0.07,0,1,isMobile and -36 or -26); TrHit.BackgroundTransparency=1; TrHit.Text=""; TrHit.ZIndex=6; TrHit.BorderSizePixel=0
     local Tr=Instance.new("Frame",TrHit); Tr.Size=UDim2.new(1,0,0,trackH); Tr.Position=UDim2.new(0,0,1,-trackH); Tr.BackgroundColor3=C.track; Tr.BorderSizePixel=0; Instance.new("UICorner",Tr).CornerRadius=UDim.new(1,0)
     local iR=math.clamp((S[key]-minV)/(maxV-minV),0,1)
@@ -913,7 +951,7 @@ local function MakeSlider(p,label,key,minV,maxV,fmt,lockWhen,order)
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
         if Locked() then return end
         slideInput = input
-        applyPos(input.Position.X)   -- snap to touch position immediately
+        applyPos(input.Position.X)
     end
     local function onInputChanged(input)
         if input ~= slideInput then return end
@@ -923,7 +961,6 @@ local function MakeSlider(p,label,key,minV,maxV,fmt,lockWhen,order)
     local function onInputEnded(input)
         if input == slideInput then slideInput=nil end
     end
-    -- Accept input from anywhere in the hit strip (includes the track and knob areas)
     TrHit.InputBegan:Connect(onInputBegan)
     TrHit.InputChanged:Connect(onInputChanged)
     TrHit.InputEnded:Connect(onInputEnded)
@@ -976,7 +1013,6 @@ end
 do
     local sc=tabScrolls["Main"]; local o=0; local function O() o+=1; return o end
 
-    -- Status card
     local StatusCard=Instance.new("Frame",sc)
     StatusCard.Size=UDim2.new(0.9,0,0,isMobile and 76 or 62)
     StatusCard.BackgroundColor3=C.panel; StatusCard.BorderSizePixel=0; StatusCard.LayoutOrder=O()
@@ -1080,10 +1116,8 @@ end
 do
     local sc=tabScrolls["Detect"]; local o=0; local function O() o+=1; return o end
 
-    -- ── Aerodynamic Slash ────────────────────────────────────────
     MakeSection(sc,"  ⚡  Aerodynamic Slash",O()); MakeDivider(sc,O())
 
-    -- Status card
     local AeroCard=Instance.new("Frame",sc)
     AeroCard.Size=UDim2.new(0.9,0,0,isMobile and 68 or 56)
     AeroCard.BackgroundColor3=C.panel; AeroCard.BorderSizePixel=0; AeroCard.LayoutOrder=O()
@@ -1121,7 +1155,7 @@ do
         S.AeroDetect=v; if not v then ResetAeroRound() end; RefreshAeroCard()
     end,C.orange,O())
     local an1=MakeInfo(sc,C.subtext,O(),26)
-    an1.Text="  Detects when enemy uses Aerodynamic Slash.\n  Raises threshold so you parry the faster ball."
+    an1.Text="  Detects instant ball speed spike (Aero Slash).\n  Fires earlier to match the faster incoming ball."
     MakeSlider(sc,"Boost (ms)","AeroThreshBoost",10,200,"%.0f ms",nil,O())
     MakeSlider(sc,"Expire (s)","AeroDecay",0.3,3.0,"%.1f s",nil,O())
     local an2=MakeInfo(sc,C.subtext,O(),26)
@@ -1165,17 +1199,15 @@ do
 
     _G.__Z0M_UpdateCurve=function()
         RefreshAeroCard()
-        -- Aero live
         if S.AeroDetect then
             if aeroDetected then
                 AeroLiveLbl.TextColor3=C.orange
                 AeroLiveLbl.Text=string.format("⚡ AERO SLASH  +%.0fms  (%.1fs left)",S.AeroThreshBoost,math.max(0,aeroExpiry-tick()))
             else
                 AeroLiveLbl.TextColor3=C.subtext
-                AeroLiveLbl.Text=string.format("Aero: watching  base %.0f  peak %.0f u/s",aeroBaselineSpd,aeroPeakSpd)
+                AeroLiveLbl.Text=string.format("Aero: watching  prev %.0f  peak %.0f u/s",aeroPrevSpd,aeroPeakSpd)
             end
         else AeroLiveLbl.TextColor3=C.subtext; AeroLiveLbl.Text="Aero detection: OFF" end
-        -- Curve live
         if S.CurveDetection then
             local curving=IsCurving()
             CurveLbl.TextColor3=curving and C.purple or C.subtext
@@ -1283,7 +1315,6 @@ do
         _G.__Z0M_TBSetBind    =function(k) tbListening=false; S.TBKey=k; UpdateBindLbl() end
         _G.__Z0M_TBCancelBind =function()  tbListening=false; UpdateBindLbl() end
     else
-        -- Mobile: keybind not needed; TBOT floating button handles activation
         _G.__Z0M_TBListening  =function() return false end
         _G.__Z0M_TBSetBind    =function() end
         _G.__Z0M_TBCancelBind =function() end
@@ -1339,7 +1370,6 @@ do
         local function cpsEnd(input)
             if input==slideInput then slideInput=nil end
         end
-        -- Allow drag from anywhere on the track strip
         ST.InputBegan:Connect(cpsBegin); ST.InputChanged:Connect(cpsMove); ST.InputEnded:Connect(cpsEnd)
         SK.InputBegan:Connect(cpsBegin); SK.InputChanged:Connect(cpsMove); SK.InputEnded:Connect(cpsEnd)
     end
@@ -1408,7 +1438,7 @@ do
         local SB=Instance.new("TextButton",SR); SB.Size=UDim2.new(1,-46,0,30); SB.Position=UDim2.new(0,0,0,0); SB.BackgroundColor3=C.panel; SB.BorderSizePixel=0; SB.Font=Enum.Font.GothamBold; SB.TextSize=11; SB.TextXAlignment=Enum.TextXAlignment.Center; SB.AutoButtonColor=false; SB.ZIndex=4; Instance.new("UICorner",SB).CornerRadius=UDim.new(0,8); sNBtns[i]=SB
         local SL=Instance.new("TextLabel",SR); SL.Size=UDim2.new(0.7,0,0,20); SL.Position=UDim2.new(0,10,0,32); SL.BackgroundTransparency=1; SL.Font=Enum.Font.Gotham; SL.TextSize=10; SL.TextXAlignment=Enum.TextXAlignment.Left; SL.ZIndex=3; sLbls[i]=SL
         local SaveB=Instance.new("TextButton",SR); SaveB.Size=UDim2.new(0,40,0,26); SaveB.Position=UDim2.new(1,-44,0,2); SaveB.BackgroundColor3=Color3.fromRGB(20,70,28); SaveB.BorderSizePixel=0; SaveB.Font=Enum.Font.GothamBold; SaveB.TextSize=10; SaveB.TextColor3=C.green; SaveB.Text="SAVE"; SaveB.AutoButtonColor=false; SaveB.ZIndex=5; Instance.new("UICorner",SaveB).CornerRadius=UDim.new(0,6)
-        local DelB=Instance.new("TextButton",SR); DelB.Size=UDim2.new(0,40,0,20); DelB.Position=UDim2.new(1,-44,0,30); DelB.BackgroundColor3=Color3.fromRGB(70,15,15); DelB.BorderSizePixel=0; DelB.Font=Enum.Font.GothamBold; DelB.TextSize=9; DelB.TextColor3=C.red; DelB.Text="DEL"; DelB.AutoButtonColor=false; DelB.ZIndex=5; Instance.new("UICorner",DelB).CornerRadius=UDim.new(0,5)
+        local DelB=Instance.new("TextButton",SR); DelB.Size=UDim2.new(0,40,0,20); DelB.Position=UDim2.new(1,-44,0,30); DelB.BackgroundColor3=Color3.fromRGB(70,15,15); DelB.BorderSizePixel=0; DelB.Font=Enum.Font.GothamBold; DelB.TextSize=9; DelB.TextColor3=C.red; DelB.Text="DEL"; DelB.AutoButtonColor=false; DelB.ZIndex=5; Instance.new("UICorner",DelB).CornerRadius=UDim.new(0,6)
         RefSlot(i)
         SB.MouseButton1Click:Connect(function()
             local cfg=configs[i]
@@ -1486,7 +1516,6 @@ end))
 
 SwitchTab("Main")
 
--- Minimize / Close
 local minimized=false
 MinBtn.MouseButton1Click:Connect(function()
     if isMobile then
@@ -1524,5 +1553,5 @@ Track(RunService.Heartbeat:Connect(function(dt)
     end
 end))
 
-print(string.format("[z0mware v1.0] loaded  mobile=%s  ball=%s  players=%d",
+print(string.format("[z0mware v1.1] loaded  mobile=%s  ball=%s  players=%d",
     tostring(isMobile), currentBall and currentBall.Name or "waiting", #Players:GetPlayers()))
