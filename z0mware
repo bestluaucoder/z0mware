@@ -1,237 +1,300 @@
 --[[
-    ╔══════════════════════════════════════════════════════════════════╗
-    ║                  z0mware — Blade Ball  v2.0                      ║
-    ╠══════════════════════════════════════════════════════════════════╣
-    ║  Complete overhaul over v1.1 — every known bug fixed:            ║
-    ║                                                                  ║
-    ║  PRECLICKING FIX (root cause):                                   ║
-    ║   • State machine: IDLE → TARGETING → FIRED → (await leave)      ║
-    ║     Ball MUST fully leave LP.Name before re-arming.              ║
-    ║     Rapid target flips (LP→other→LP) no longer re-arm.           ║
-    ║   • CurveClear() now called on EVERY target change, not just     ║
-    ║     BindBall — stale curveAngVel no longer bleeds between rounds  ║
-    ║   • Curve TTI blend threshold raised 0.08→0.40 rad/s.            ║
-    ║     Low-frequency wobble can no longer shrink TTI to near-zero.  ║
-    ║   • TTICurve blend capped at 0.65 — even a real curve can't      ║
-    ║     collapse TTI to 0, leaving a conservative safety margin.     ║
-    ║   • PARRY_LOCKOUT raised 0.06→0.15 s                             ║
-    ║   • MIN_REFIRE_GAP: 320 ms hard floor between any two fires      ║
-    ║   • ApproachStraight now requires dot > 0.20 (was any > 0)       ║
-    ║     so a ball passing sideways never triggers                     ║
-    ║                                                                  ║
-    ║  CPS TIMER FIX:                                                  ║
-    ║   • cpsMeasTimer now drains with while loop, not -= 1            ║
-    ║     (single subtract lost counts on lag spikes)                  ║
-    ║                                                                  ║
-    ║  ANTI-CURVE FIX:                                                 ║
-    ║   • Physics override is now single-shot on parry instead of      ║
-    ║     hammering AssemblyLinearVelocity every frame for 0.35 s.     ║
-    ║     Per-frame override was detectable and caused jitter.         ║
-    ║                                                                  ║
-    ║  MOBILE FIXES:                                                   ║
-    ║   • moved flag now resets on every new InputBegan (was sticky)   ║
-    ║   • All draggable buttons use consistent 20 px threshold         ║
-    ║   • Menu spawns centered regardless of device resolution         ║
-    ║   • MobileTBBtn state fully syncs on every activation change     ║
-    ║                                                                  ║
-    ║  ESP FIX:                                                        ║
-    ║   • Heartbeat connections now stored per-label and cleaned up    ║
-    ║     correctly during char respawn — no connection leaks          ║
-    ║                                                                  ║
-    ║  MISC:                                                           ║
-    ║   • Aero baseline minimum raised 30→45 u/s                       ║
-    ║   • AutoTiming slider shows real computed threshold, not base    ║
-    ║   • Ball detection order: realBall attr → "Ball" name → first    ║
-    ║   • FPS: NukeAll now records baseline before first toggle too    ║
-    ╚══════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║               z0mware — Blade Ball  v3.0                         ║
+║               Complete rewrite — clean state machine             ║
+╠══════════════════════════════════════════════════════════════════╣
+║  LOADSTRING:                                                     ║
+║    _G.Z0M = { TBExpCps=469, TBUseExp=true, AutoTiming=true }     ║
+║    loadstring(game:HttpGet("RAW_URL"))()                          ║
+╠══════════════════════════════════════════════════════════════════╣
+║  KEYBINDS (PC):                                                  ║
+║    RCtrl         → toggle menu                                   ║
+║    F             → toggle Auto Parry                             ║
+║    LAlt (hold)   → triggerbot (default, configurable)            ║
+╚══════════════════════════════════════════════════════════════════╝
 --]]
 
--- ════════════════════════════════════ Services ══
-local Players             = game:GetService("Players")
-local RunService          = game:GetService("RunService")
-local TweenService        = game:GetService("TweenService")
-local UserInputService    = game:GetService("UserInputService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local HttpService         = game:GetService("HttpService")
-local Camera              = workspace.CurrentCamera
+-- ═══════════════════════════════════════════ SERVICES ══
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local UIS              = game:GetService("UserInputService")
+local VIM              = game:GetService("VirtualInputManager")
+local HttpService      = game:GetService("HttpService")
+local Lighting         = game:GetService("Lighting")
+local Camera           = workspace.CurrentCamera
 
 local LP         = Players.LocalPlayer
 local BallFolder = workspace:WaitForChild("Balls", 15)
 
--- ══════════════════════════════════ Mobile detect ══
-local isMobile = UserInputService.TouchEnabled
-    and not game:GetService("GuiService"):IsTenFootInterface()
+local isMobile = UIS.TouchEnabled and not game:GetService("GuiService"):IsTenFootInterface()
 
--- ══════════════════════════════════ Kill old instances ══
-do
-    local function kill(n)
-        local ok, cg = pcall(function() return game:GetService("CoreGui") end)
-        for _, p in ipairs({ ok and cg or nil, LP:WaitForChild("PlayerGui") }) do
-            if p then
-                local e = p:FindFirstChild(n)
-                if e then e:Destroy() end
-            end
-        end
-    end
-    for _, v in ipairs({
-        "z0mware_v1","z0mware_v11","z0mware_v20",
-        "NoEnemiesHub_v72","NoEnemiesHub_v71","NoEnemiesHub_v70",
-        "NoEnemiesHub_v62","NoEnemiesHub_v61","NoEnemiesHub_v60","NoEnemiesHub_v53",
-    }) do kill(v) end
-end
-
--- ════════════════════════════════════ Settings ══
+-- ═══════════════════════════════════════════ SETTINGS ══
 local S = {
-    AutoParry        = true,
-    AutoTiming       = true,
-    ClashMode        = false,
-    TriggerTime      = 0.2355,
-    ClashDist        = 7.5,
-    MaxFires         = 1,          -- default 1; >1 is redundant with state machine but still works
-    CurveDetection   = true,
-    AutoCurve        = false,
-    AntiCurve        = true,
-    ACSnapDur        = 0.18,
-    AntiCurveDur     = 0.30,
-    PlayerNameESP    = false,
-    PlayerAbilityESP = false,
-    CharTrail        = true,
-    TBEnabled        = true,
-    TBMode           = "hold",
-    TBKey            = Enum.KeyCode.LeftAlt,
-    TBCps            = 60,
-    TBExpCps         = 500,
-    TBUseExp         = true,
-    ShowCPSCounter   = true,
-    MenuKey          = Enum.KeyCode.RightControl,
-    AeroDetect       = true,
-    AeroThreshBoost  = 60,
-    AeroDecay        = 1.2,
+    -- Combat
+    AutoParry    = true,
+    AutoTiming   = true,
+    TriggerTime  = 0.235,   -- manual TTI threshold (seconds)
+    MinFireDist  = 8.0,     -- AutoTiming: always fire at this many studs minimum
+    ClashMode    = false,
+    ClashDist    = 7.5,
+    -- Detection
+    CurveDetect  = true,
+    AutoCurve    = false,
+    ACSnapDur    = 0.18,
+    AntiCurve    = true,
+    AntiCurveDur = 0.16,
+    AeroDetect   = false,
+    AeroBoost    = 60,      -- ms added to threshold when Aero detected
+    AeroDecay    = 1.2,     -- seconds before Aero detection resets
+    -- Visual
+    PlayerESP    = true,
+    AbilityESP   = true,
+    CharTrail    = true,
+    ShowCPS      = true,
+    -- Triggerbot
+    TBEnabled    = true,
+    TBMode       = "hold",  -- "hold" | "toggle"
+    TBKey        = Enum.KeyCode.LeftAlt,
+    TBCps        = 122,
+    TBExpCps     = 172,
+    TBUseExp     = true,
+    -- System
+    MenuKey      = Enum.KeyCode.RightControl,
 }
 
-local _conns = {}
-local function Track(c) _conns[#_conns + 1] = c; return c end
+-- _G.Z0M settings injection (for loadstring usage)
+if type(_G.Z0M) == "table" then
+    for k, v in pairs(_G.Z0M) do
+        if S[k] ~= nil then S[k] = v end
+    end
+    for _, key in ipairs({"TBKey","MenuKey"}) do
+        local raw = _G.Z0M[key]
+        if raw then
+            local s = tostring(raw):gsub("Enum%.KeyCode%.","")
+            local ok, kc = pcall(function() return Enum.KeyCode[s] end)
+            if ok and kc then S[key] = kc end
+        end
+    end
+end
 
--- ══════════════════════════════ AERO SLASH DETECTION ══
--- Pure EMA baseline — no artificial floor.
--- Require baseline ≥ 45 u/s before trusting, and a genuine 1.68× spike.
-local aeroDetected    = false
-local aeroExpiry      = 0
-local aeroBaselineSpd = 0
-local aeroPeakSpd     = 0
-local AERO_SPIKE_MULT = 1.68
-local AERO_MIN_BASE   = 45    -- raised from 30 → 45 for more stable reads
+-- ═══════════════════════════════════ GLOBAL INPUT STATE ══
+-- Single shared state for all drags and sliders.
+-- Using UIS.InputChanged (fires globally) instead of per-element
+-- InputChanged (stops when cursor leaves element bounds on PC).
+local _drag  = nil   -- { frame, origin, startPos, thresh?, movedRef? }
+local _slide = nil   -- function(screenX)
+
+local _conns = {}
+local function Con(c) _conns[#_conns+1] = c; return c end
+
+Con(UIS.InputChanged:Connect(function(i)
+    local t = i.UserInputType
+    if t ~= Enum.UserInputType.MouseMovement and t ~= Enum.UserInputType.Touch then return end
+    local pos = i.Position
+    if _drag then
+        local d = pos - _drag.origin
+        if _drag.movedRef then
+            if d.Magnitude > (_drag.thresh or 8) then _drag.movedRef.v = true end
+        end
+        local sp = _drag.startPos
+        _drag.frame.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
+    end
+    if _slide then _slide(pos.X) end
+end))
+
+Con(UIS.InputEnded:Connect(function(i)
+    local t = i.UserInputType
+    if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+        _drag  = nil
+        _slide = nil
+    end
+end))
+
+local function MakeDraggable(frame, handle, thresh, movedRef)
+    handle = handle or frame
+    handle.InputBegan:Connect(function(i)
+        local t = i.UserInputType
+        if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then return end
+        _drag = { frame=frame, origin=i.Position, startPos=frame.Position, thresh=thresh, movedRef=movedRef }
+    end)
+end
+
+-- ══════════════════════════════ KILL OLD INSTANCES ══
+do
+    local function Kill(n)
+        local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+        for _, p in ipairs({ok and cg or nil, LP:WaitForChild("PlayerGui")}) do
+            if p then local e = p:FindFirstChild(n); if e then e:Destroy() end end
+        end
+    end
+    for _, n in ipairs({
+        "z0mware_v1","z0mware_v11","z0mware_v20","z0mware_v21","z0mware_v30",
+        "NoEnemiesHub_v72","NoEnemiesHub_v71","NoEnemiesHub_v70",
+    }) do Kill(n) end
+end
+
+-- ═══════════════════════════════════════ PING / FPS ══
+local smoothPing = 20; local peakPing = 20; local displayPing = 20
+local pingBuf = {}; local pingPtr = 1; local PING_WIN = 30
+for i=1,PING_WIN do pingBuf[i]=20 end
+
+local smoothFPS = 60; local rawFPS = 60; local fpsLow = false
+local dtBuf = {}; local dtPtr = 1; local DT_WIN = 20; local dtVar = 0
+for i=1,DT_WIN do dtBuf[i]=1/60 end
+
+local function UpdatePing()
+    local raw = LP:GetNetworkPing() * 1000
+    pingBuf[pingPtr] = raw; pingPtr = pingPtr % PING_WIN + 1
+    smoothPing = smoothPing + 0.10 * (raw - smoothPing)
+    local pk = 0
+    for _, v in ipairs(pingBuf) do if v > pk then pk = v end end
+    peakPing = pk; displayPing = smoothPing
+end
+
+local function UpdateFPS(dt)
+    rawFPS = dt > 0 and 1/dt or 60
+    smoothFPS = smoothFPS + 0.12 * (rawFPS - smoothFPS)
+    fpsLow = smoothFPS < 45
+    dtBuf[dtPtr] = dt; dtPtr = dtPtr % DT_WIN + 1
+    local m = 0
+    for _, v in ipairs(dtBuf) do m = m + v end; m = m / DT_WIN
+    local s = 0
+    for _, v in ipairs(dtBuf) do s = s + (v-m)^2 end
+    dtVar = s / DT_WIN
+end
+
+-- ════════════════════════════ AERO DETECTION ══
+-- Detects the "Aerodynamic Slash" ability which spikes the ball's speed.
+-- Uses an EMA baseline; when a 1.68× spike is seen → detected.
+local aeroDetected = false
+local aeroExpiry   = 0
+local aeroBase     = 0
+local aeroPeak     = 0
+local AERO_SPIKE   = 1.68
+local AERO_MIN     = 35    -- u/s baseline minimum before trusting
 
 local function UpdateAero(ball)
     if not S.AeroDetect then aeroDetected = false; return end
     local z = ball:FindFirstChild("zoomies"); if not z then return end
     local spd = z.VectorVelocity.Magnitude; if spd < 2 then return end
     local now = tick()
-    aeroBaselineSpd = aeroBaselineSpd + 0.05 * (spd - aeroBaselineSpd)
-    if spd > aeroPeakSpd then aeroPeakSpd = spd end
-    if aeroBaselineSpd >= AERO_MIN_BASE and spd >= aeroBaselineSpd * AERO_SPIKE_MULT then
+    aeroBase = aeroBase + 0.08 * (spd - aeroBase)
+    if spd > aeroPeak then aeroPeak = spd end
+    if aeroBase >= AERO_MIN and spd >= aeroBase * AERO_SPIKE then
         aeroDetected = true; aeroExpiry = now + S.AeroDecay
     end
     if aeroDetected and now >= aeroExpiry then aeroDetected = false end
 end
 
-local function ResetAeroRound()
-    aeroDetected = false; aeroBaselineSpd = 0; aeroPeakSpd = 0; aeroExpiry = 0
+local function ResetAero()
+    aeroDetected = false; aeroBase = 0; aeroPeak = 0; aeroExpiry = 0
 end
 
--- ══════════════════════════════════ FPS / Jitter ══
-local smoothFPS = 60; local rawFPS = 60; local fpsLow = false
-local dtHistory = {}; local dtPtr = 1; local DT_WIN = 20; local dtVar = 0
-for i = 1, DT_WIN do dtHistory[i] = 1 / 60 end
+-- ═════════════════════════════ CURVE ENGINE ══
+-- Tracks ball angular velocity to detect curving paths (homing, spin abilities).
+-- Lower CURVE_THRESH = more sensitive to real curves without false positives.
+local CURVE_THRESH  = 0.20   -- rad/s
+local CURVE_SAMPLES = 12
+local cBuf = {}; local cPtr = 1
+local curveAngVel = 0; local curveAxis = Vector3.new(0,1,0); local homingBias = 0
+for i=1,CURVE_SAMPLES do cBuf[i]={pos=Vector3.zero, vel=Vector3.zero, t=0} end
 
-local function UpdateFPS(dt)
-    rawFPS = dt > 0 and 1 / dt or 60
-    smoothFPS = smoothFPS + 0.12 * (rawFPS - smoothFPS)
-    fpsLow = smoothFPS < 45
-    dtHistory[dtPtr] = dt; dtPtr = (dtPtr % DT_WIN) + 1
-    local m = 0
-    for _, v in ipairs(dtHistory) do m = m + v end; m = m / DT_WIN
-    local s = 0
-    for _, v in ipairs(dtHistory) do s = s + (v - m) ^ 2 end
-    dtVar = s / DT_WIN
+local function CurveClear()
+    for i=1,CURVE_SAMPLES do cBuf[i]={pos=Vector3.zero, vel=Vector3.zero, t=0} end
+    cPtr=1; curveAngVel=0; curveAxis=Vector3.new(0,1,0); homingBias=0
 end
-
--- ═══════════════════════════════════════ Ping ══
-local PING_WIN = 30; local pingBuf = {}; local pingPtr = 1
-local smoothPing = 20; local peakPing = 20; local livePing = 20; local displayPing = 20
-for i = 1, PING_WIN do pingBuf[i] = 20 end
-
-local function UpdatePing()
-    local raw = LP:GetNetworkPing() * 1000
-    pingBuf[pingPtr] = raw; pingPtr = (pingPtr % PING_WIN) + 1
-    smoothPing = smoothPing + 0.10 * (raw - smoothPing)
-    local pk = 0
-    for _, v in ipairs(pingBuf) do if v > pk then pk = v end end
-    peakPing = pk; livePing = math.max(smoothPing, peakPing); displayPing = smoothPing
-end
-
-local function GetThreshold()
-    local base = S.AutoTiming and 0.155 or S.TriggerTime
-    local pingC = math.clamp(smoothPing / 2000, 0, 0.04)
-    local fpsC  = fpsLow and math.clamp((60 - smoothFPS) / 60 * 0.04, 0, 0.04) or 0
-    local jitC  = math.clamp(math.sqrt(dtVar) * 1.5, 0, 0.025)
-    local aeroC = (aeroDetected and S.AeroDetect) and S.AeroThreshBoost / 1000 or 0
-    return base + pingC + fpsC + jitC + aeroC
-end
-
--- ══════════════════════════════════ CURVE ENGINE ══
--- FIX: CURVE_TTI_THRESHOLD raised 0.08 → 0.40 rad/s.
--- At 0.08 any tiny wobble engaged curve TTI, which could collapse it to near 0.
--- At 0.40 only genuine fast curves (homing, spin abilities) engage it.
-local CURVE_TTI_THRESHOLD = 0.40
-local CURVE_SAMPLES = 12; local curveBuf = {}; local curveBufPtr = 1
-local curveAngVel = 0; local curveAxis = Vector3.new(0, 1, 0); local curveHomingBias = 0
-for i = 1, CURVE_SAMPLES do curveBuf[i] = { pos = Vector3.new(), vel = Vector3.new(), t = 0 } end
 
 local function CurveSample(ball)
     local z = ball:FindFirstChild("zoomies"); if not z then return end
-    curveBuf[curveBufPtr] = { pos = ball.Position, vel = z.VectorVelocity, t = tick() }
-    curveBufPtr = (curveBufPtr % CURVE_SAMPLES) + 1
+    cBuf[cPtr] = {pos=ball.Position, vel=z.VectorVelocity, t=tick()}
+    cPtr = cPtr % CURVE_SAMPLES + 1
 end
 
 local function CurveAnalyse()
-    local function sample(off)
-        return curveBuf[((curveBufPtr - 2 - off) % CURVE_SAMPLES) + 1]
-    end
-    local a, b = sample(0), sample(1)
+    local function smp(off) return cBuf[(cPtr-2-off) % CURVE_SAMPLES + 1] end
+    local a, b = smp(0), smp(1)
     local dt = a.t - b.t; if dt < 0.004 then return end
     local aM = a.vel.Magnitude; local bM = b.vel.Magnitude
     if aM < 1 or bM < 1 then return end
-    local aD = a.vel / aM; local bD = b.vel / bM
+    local aD = a.vel/aM; local bD = b.vel/bM
     local dot = math.clamp(aD:Dot(bD), -1, 1)
-    curveAngVel = curveAngVel + 0.35 * (math.acos(dot) / dt - curveAngVel)
+    curveAngVel = curveAngVel + 0.25 * (math.acos(dot)/dt - curveAngVel)
     local ax = bD:Cross(aD)
     if ax.Magnitude > 0.0001 then curveAxis = ax.Unit end
-    curveHomingBias = math.clamp(math.abs(aM - bM) / dt / 200, 0, 1)
+    homingBias = math.clamp(math.abs(aM-bM)/dt/200, 0, 1)
 end
+
+local function IsCurving() return S.CurveDetect and curveAngVel > CURVE_THRESH end
 
 local function CurvePredict(ball, lookahead)
     local z = ball:FindFirstChild("zoomies"); if not z then return ball.Position end
     local pos = ball.Position; local vel = z.VectorVelocity; local spd = vel.Magnitude
     if spd < 1 then return pos end
-    if curveAngVel < CURVE_TTI_THRESHOLD then return pos + vel * lookahead end
+    if curveAngVel < CURVE_THRESH then return pos + vel * lookahead end
     local STEPS = 10; local stepDt = lookahead / STEPS; local curV = vel
     for _ = 1, STEPS do
-        local rot = CFrame.fromAxisAngle(curveAxis, curveAngVel * stepDt)
-        curV = rot * curV.Unit * spd; pos = pos + curV * stepDt
+        curV = CFrame.fromAxisAngle(curveAxis, curveAngVel * stepDt) * curV.Unit * spd
+        pos = pos + curV * stepDt
     end
     return pos
 end
 
-local function CurveClear()
-    for i = 1, CURVE_SAMPLES do curveBuf[i] = { pos = Vector3.new(), vel = Vector3.new(), t = 0 } end
-    curveBufPtr = 1; curveAngVel = 0; curveAxis = Vector3.new(0, 1, 0); curveHomingBias = 0
+-- ═════════════════════════════ THRESHOLD ══
+-- Returns the firing TTI threshold in seconds.
+-- For AutoTiming: base 0.155s + ping/fps/jitter/aero compensations.
+-- Manual: just S.TriggerTime + compensations.
+-- The per-frame distance floor (MinFireDist) is applied in the main loop.
+local function GetThreshold()
+    local base = S.AutoTiming and 0.155 or S.TriggerTime
+    local pingC  = math.clamp(smoothPing / 2000, 0, 0.04)
+    local fpsC   = fpsLow and math.clamp((60-smoothFPS)/60*0.04, 0, 0.04) or 0
+    local jitC   = math.clamp(math.sqrt(dtVar) * 1.5, 0, 0.025)
+    local aeroC  = (aeroDetected and S.AeroDetect) and S.AeroBoost/1000 or 0
+    return base + pingC + fpsC + jitC + aeroC
 end
 
-local function IsCurving() return S.CurveDetection and curveAngVel > CURVE_TTI_THRESHOLD end
+-- ═════════════════════════════════ TTI ══
+-- Returns time-to-impact in seconds.
+-- Returns math.huge if ball has no velocity data → no premature fire on spawn.
+local function GetTTI(ball, hrp, dt)
+    local z = ball:FindFirstChild("zoomies")
+    if not z then return math.huge end
+    local vel = z.VectorVelocity; local spd = vel.Magnitude
+    if spd < 0.5 then return math.huge end
 
--- ════════════════════════════════ AUTO CURVE ══
-local acPinTarget = nil; local acCamRestoring = false
+    if IsCurving() then
+        -- Blend straight TTI with curve-predicted TTI
+        local dist = (hrp.Position - ball.Position).Magnitude
+        local lookahead = dist / spd
+        local pDist = (hrp.Position - CurvePredict(ball, lookahead)).Magnitude
+        local blend = math.clamp((curveAngVel - CURVE_THRESH) / 0.80, 0, 0.65)
+        local blended = pDist * blend + dist * (1 - blend)
+        return math.max(0, blended / spd)
+    else
+        local predicted = ball.Position + vel * (dt or 1/60)
+        local dist = (hrp.Position - predicted).Magnitude
+        return math.max(0, dist / spd)
+    end
+end
+
+-- ═══════════════════════════════ APPROACH CHECK ══
+local function IsApproaching(ball, hrp)
+    local z = ball:FindFirstChild("zoomies")
+    if not z or z.VectorVelocity.Magnitude < 0.5 then return true end
+    local toP = hrp.Position - ball.Position
+    local len = toP.Magnitude
+    if len < 0.01 then return true end
+    if S.CurveDetect and IsCurving() then
+        local fP = CurvePredict(ball, 0.12)
+        return (hrp.Position - fP).Magnitude < len
+    end
+    return z.VectorVelocity.Unit:Dot(toP / len) > 0.20
+end
+
+-- ═══════════════════════════════ AUTO CURVE ══
+local acPinTarget    = nil
+local acCamRestoring = false
 
 local function GetCurveTarget()
     if acPinTarget and acPinTarget.Character then
@@ -254,276 +317,197 @@ local function GetCurveTarget()
 end
 
 local function DoAutoCurve()
-    if not S.AutoCurve then return end
-    local target = GetCurveTarget()
-    if not target or acCamRestoring then return end
-    Camera.CFrame = CFrame.new(Camera.CFrame.Position, target.Position + Vector3.new(0, 1.5, 0))
+    if not S.AutoCurve or acCamRestoring then return end
+    local tgt = GetCurveTarget(); if not tgt then return end
+    Camera.CFrame = CFrame.new(Camera.CFrame.Position, tgt.Position + Vector3.new(0,1.5,0))
     acCamRestoring = true
     task.delay(S.ACSnapDur, function() acCamRestoring = false end)
 end
 
--- ═══════════════════ CORE PARRY VARS ══
-local cachedHRP     = nil
-local currentBall   = nil
-local ballConn      = nil
-local fireCount     = 0
-local inWindow      = false
-local hasParried    = false
--- FIX: State machine for re-arm.
--- ballTargetedUs tracks whether the current ball→LP assignment is "fresh"
--- (ball left and came back) vs a rapid re-flip.
-local ballWasAway   = true   -- true = ball has left since last fire, safe to re-arm
-local lastParryTime = 0
-local PARRY_LOCKOUT  = 0.15  -- was 0.06 — prevent re-trigger within same approach burst
-local MIN_REFIRE_GAP = 0.32  -- hard floor between any two fires regardless of state
+-- ═══════════════════════════════ ANTI CURVE ══
+local antiActive = false; local antiExpiry = 0
 
+local function DoAntiCurve()
+    if not S.AntiCurve then return end
+    local ball = rawget(_G, "__Z0M_ball")  -- will be set in ball tracking
+    if not ball or not ball.Parent then return end
+    local z = ball:FindFirstChild("zoomies"); if not z then return end
+    local spd = z.VectorVelocity.Magnitude; if spd < 1 then return end
+    local tgt = GetCurveTarget()
+    local dir = tgt and (tgt.Position - ball.Position).Unit or z.VectorVelocity.Unit
+    local sv = dir * spd
+    pcall(function()
+        ball.AssemblyLinearVelocity  = sv
+        ball.AssemblyAngularVelocity = Vector3.zero
+    end)
+    pcall(function() z.VectorVelocity = sv end)
+    antiActive = true; antiExpiry = tick() + S.AntiCurveDur
+end
+
+-- ═══════════════════════════ PARRY STATE MACHINE ══
+-- States: IDLE=0, ARMED=1, FIRED=2
+-- IDLE  → ARMED : ball.target == LP.Name (from IDLE only)
+-- ARMED → FIRED : TTI ≤ threshold  (we fire exactly once)
+-- FIRED → IDLE  : ball.target ~= LP.Name (ball left, safe to re-arm)
+--
+-- This replaces the old hasParried/ballWasAway dual-flag approach.
+-- The only way to re-fire is IDLE→ARMED→FIRED, which requires the
+-- ball to have genuinely left us first (FIRED→IDLE transition).
+local IDLE  = 0
+local ARMED = 1
+local FIRED = 2
+local parryState  = IDLE
+local lastFired   = 0
+local MIN_REFIRE  = 0.30  -- hard floor between fires (safety net)
+
+local currentBall = nil
+local ballConn    = nil
+local cachedHRP   = nil
+_G.__Z0M_ball     = nil   -- exposed for AntiCurve
+
+-- Triggerbot state
+local tbActive     = false
+local tbToggleOn   = false
+local tbLastFire   = 0
+local autoParryBak = true
+
+-- CPS measurement
 local cpsFireBucket = 0; local cpsActual = 0; local cpsMeasTimer = 0
 
--- ══════════════════════════════ ANTI CURVE ENGINE ══
--- FIX: Single-shot physics override instead of per-frame hammering.
--- Per-frame was detectable and caused velocity jitter.
-local antiCurveActive = false
-local antiCurveExpiry = 0
-
-local function StartAntiCurve()
-    if not S.AntiCurve then return end
-    local ball = currentBall
-    if not ball or not ball.Parent then return end
-    local z = ball:FindFirstChild("zoomies")
-    local spd = z and z.VectorVelocity.Magnitude or 0
-    if spd < 1 then return end
-
-    -- Compute target direction for the override
-    local target = GetCurveTarget()
-    local dir
-    if target then
-        dir = (target.Position - ball.Position).Unit
-    elseif z then
-        dir = z.VectorVelocity.Unit
-    end
-    if not dir then return end
-
-    local sv = dir * spd
-    -- Single-shot override applied right now
-    pcall(function() ball.AssemblyLinearVelocity = sv; ball.AssemblyAngularVelocity = Vector3.zero end)
-    if z then pcall(function() z.VectorVelocity = sv end) end
-
-    antiCurveActive = true
-    antiCurveExpiry = tick() + S.AntiCurveDur
-end
-
--- ══════════════════════════════════ PARRY FIRE ══
 local function FireParry()
-    lastParryTime = tick()
-    ballWasAway = false  -- ball is still targeting us; don't re-arm until it leaves
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+    lastFired = tick()
+    VIM:SendMouseButtonEvent(0, 0, 0, true,  game, 0)
+    VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0)
     DoAutoCurve()
-    StartAntiCurve()
+    DoAntiCurve()
 end
 
-local function FireParryCPS() cpsFireBucket = cpsFireBucket + 1; FireParry() end
+local function ActivateTB()
+    if tbActive then return end
+    autoParryBak = S.AutoParry; S.AutoParry = false; tbActive = true
+    if _G.__Z0M_SyncTB then _G.__Z0M_SyncTB() end
+end
+local function DeactivateTB()
+    if not tbActive then return end
+    tbActive = false; S.AutoParry = autoParryBak
+    if _G.__Z0M_SyncTB then _G.__Z0M_SyncTB() end
+end
 
+-- ═══════════════════════════════ BALL TRACKING ══
 local function GetBall()
     if not BallFolder then return nil end
-    -- Priority 1: explicit realBall attribute
+    -- Priority: explicit realBall attr → name "Ball" → any BasePart/Model
     for _, b in ipairs(BallFolder:GetChildren()) do
         if b:GetAttribute("realBall") then return b end
     end
-    -- Priority 2: named "Ball"
     for _, b in ipairs(BallFolder:GetChildren()) do
         if b.Name == "Ball" then return b end
     end
-    -- Priority 3: any BasePart/Model
     for _, b in ipairs(BallFolder:GetChildren()) do
         if b:IsA("BasePart") or b:IsA("Model") then return b end
     end
     return nil
 end
 
--- ══════════════════════════════════ APPROACH / TTI ══
--- FIX: require normalized dot > 0.20 instead of raw dot > 0
--- so a ball passing sideways (dot barely positive) does not trigger.
-local function ApproachStraight(ball, hrp)
-    local z = ball:FindFirstChild("zoomies")
-    if not z or z.VectorVelocity.Magnitude < 1 then return true end
-    local toPlayer = (hrp.Position - ball.Position)
-    local tpLen = toPlayer.Magnitude
-    if tpLen < 0.01 then return true end
-    return z.VectorVelocity.Unit:Dot(toPlayer / tpLen) > 0.20
-end
-
-local function ApproachCurve(ball, hrp)
-    local fP = CurvePredict(ball, 0.12)
-    return (hrp.Position - fP).Magnitude < (hrp.Position - ball.Position).Magnitude
-        or ApproachStraight(ball, hrp)
-end
-
-local function IsApproaching(ball, hrp)
-    if tick() - lastParryTime < PARRY_LOCKOUT then return false end
-    return S.CurveDetection and ApproachCurve(ball, hrp) or ApproachStraight(ball, hrp)
-end
-
-local function TTIStraight(ball, hrp, dt)
-    local z = ball:FindFirstChild("zoomies"); if not z then return 0 end
-    local vel = z.VectorVelocity; local spd = vel.Magnitude; if spd < 1 then return 0 end
-    local predictedPos = ball.Position + vel * (dt or 1 / 60)
-    return math.max(0, (hrp.Position - predictedPos).Magnitude / spd)
-end
-
--- FIX: TTICurve now only blends in curve prediction above CURVE_TTI_THRESHOLD,
--- and the blend is capped at 0.65 so TTI can never collapse to near 0.
-local function TTICurve(ball, hrp, dt)
-    local z = ball:FindFirstChild("zoomies"); if not z then return 0 end
-    local vel = z.VectorVelocity; local spd = vel.Magnitude; if spd < 1 then return 0 end
-    local predictedPos = ball.Position + vel * (dt or 1 / 60)
-    local dist = (hrp.Position - predictedPos).Magnitude
-    if curveAngVel < CURVE_TTI_THRESHOLD then
-        return math.max(0, dist / spd)
-    end
-    local lookahead = dist / spd
-    local pD = (hrp.Position - CurvePredict(ball, lookahead)).Magnitude
-    -- Blend increases with angular velocity, hard-capped at 0.65
-    local blend = math.clamp((curveAngVel - CURVE_TTI_THRESHOLD) / 0.80, 0, 0.65)
-    local blended = pD * blend + dist * (1 - blend)
-    return math.max(0, blended / spd)
-end
-
-local function GetTTI(ball, hrp, dt)
-    return S.CurveDetection and TTICurve(ball, hrp, dt) or TTIStraight(ball, hrp, dt)
-end
-
--- ── Triggerbot ───────────────────────────────────────────────────
-local tbActive = false; local tbToggleOn = false
-local tbLastFire = 0; local autoParryBackup = true
-
-local function ActivateTriggerbot()
-    if tbActive then return end
-    autoParryBackup = S.AutoParry; S.AutoParry = false; tbActive = true
-    if _G.__Z0M_RefreshStatus   then _G.__Z0M_RefreshStatus()   end
-    if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
-    if _G.__Z0M_RefreshMobileTB then _G.__Z0M_RefreshMobileTB() end
-end
-
-local function DeactivateTriggerbot()
-    if not tbActive then return end
-    tbActive = false; S.AutoParry = autoParryBackup
-    if _G.__Z0M_RefreshStatus   then _G.__Z0M_RefreshStatus()   end
-    if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
-    if _G.__Z0M_RefreshMobileTB then _G.__Z0M_RefreshMobileTB() end
-end
-
--- ── Ball binding ─────────────────────────────────────────────────
 local function DisconnectBall()
     if ballConn then ballConn:Disconnect(); ballConn = nil end
-    currentBall = nil; fireCount = 0; inWindow = false
-    hasParried = false; ballWasAway = true
+    currentBall = nil; _G.__Z0M_ball = nil
+    parryState = IDLE; tbLastFire = 0
+    CurveClear(); ResetAero()
 end
 
 local function BindBall(ball)
     if ballConn then ballConn:Disconnect(); ballConn = nil end
-    currentBall   = ball
-    fireCount     = 0
-    inWindow      = false
-    hasParried    = false
-    ballWasAway   = true
-    lastParryTime = 0
-    CurveClear()
-    ResetAeroRound()
+
+    currentBall = ball; _G.__Z0M_ball = ball
+    parryState  = IDLE
+    lastFired   = 0
+    tbLastFire  = 0
+    CurveClear(); ResetAero()
+
     if not ball then return end
 
-    -- FIX: Smart target-change handler with state machine.
-    -- Key insight: ballWasAway must be TRUE before we allow hasParried to reset.
-    -- This prevents rapid LP→other→LP flips from re-arming the parry.
-    ballConn = ball:GetAttributeChangedSignal("target"):Connect(function()
-        -- ALWAYS clear curve data on target change — stale curveAngVel caused
-        -- false curve-TTI pre-clicks between rounds on the same ball instance.
-        CurveClear()
-        ResetAeroRound()
+    -- Immediately check current target — ball may ALREADY be targeting us
+    if ball:GetAttribute("target") == LP.Name then
+        parryState = ARMED
+    end
 
-        local newTgt = ball:GetAttribute("target")
-        if newTgt ~= LP.Name then
-            -- Ball left us — mark so we can re-arm on next arrival
-            ballWasAway = true
-            inWindow    = false
-            fireCount   = 0
-            -- Note: intentionally do NOT reset hasParried here.
-            -- hasParried will be cleared when ball comes back to us (below).
-        else
-            -- Ball is now targeting us
-            if ballWasAway then
-                -- Genuine new approach — safe to re-arm
-                hasParried  = false
-                fireCount   = 0
-                inWindow    = false
-                ballWasAway = false
+    -- Watch for target changes
+    ballConn = ball:GetAttributeChangedSignal("target"):Connect(function()
+        CurveClear(); ResetAero()
+        local tgt = ball:GetAttribute("target")
+        if tgt == LP.Name then
+            -- Ball just targeted us — only arm from IDLE
+            if parryState == IDLE then
+                parryState = ARMED
             end
-            -- If !ballWasAway: rapid flip back to us — keep hasParried=true,
-            -- preventing the spam-fire that caused the pre-clicking bug.
+        else
+            -- Ball left us — reset to IDLE so we can arm again next time
+            parryState = IDLE
         end
     end)
 end
 
 local function SetupBallFolder()
     if not BallFolder then return end
-    Track(BallFolder.ChildAdded:Connect(function()
+    Con(BallFolder.ChildAdded:Connect(function(child)
         task.spawn(function()
-            for _ = 1, 10 do
-                task.wait(0.05)
-                local b = GetBall()
-                if b then BindBall(b); return end
-            end
-            BindBall(GetBall())
+            -- Bind immediately — don't wait
+            if child and child.Parent then BindBall(child) end
+            -- Sanity re-check after brief delay (attributes may not be set yet)
+            task.wait(0.15)
+            local b = GetBall()
+            if b and b ~= currentBall then BindBall(b) end
         end)
     end))
-    Track(BallFolder.ChildRemoved:Connect(function()
+    Con(BallFolder.ChildRemoved:Connect(function()
         task.wait()
         local b = GetBall()
         if b then BindBall(b) else DisconnectBall() end
     end))
     BindBall(GetBall())
 end
-SetupBallFolder()
 
-local function CacheCharacter(char)
-    fireCount = 0; inWindow = false; hasParried = false
-    ballWasAway = true; cachedHRP = nil; BindBall(GetBall())
+local function SetupCharacter(char)
+    parryState = IDLE; cachedHRP = nil
+    BindBall(GetBall())
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        cachedHRP = hrp
-    else
-        task.spawn(function() cachedHRP = char:WaitForChild("HumanoidRootPart", 10) end)
-    end
+    if hrp then cachedHRP = hrp
+    else task.spawn(function() cachedHRP = char:WaitForChild("HumanoidRootPart", 10) end) end
 end
-CacheCharacter(LP.Character)
-Track(LP.CharacterAdded:Connect(CacheCharacter))
 
--- ══════════════════════════════════ MAIN LOOP ══
-Track(RunService.PreSimulation:Connect(function(dt)
+SetupBallFolder()
+SetupCharacter(LP.Character)
+Con(LP.CharacterAdded:Connect(SetupCharacter))
+
+-- ═══════════════════════════════════ MAIN LOOP ══
+Con(RunService.PreSimulation:Connect(function(dt)
     UpdatePing(); UpdateFPS(dt)
+
     if currentBall and currentBall.Parent then
-        if S.CurveDetection then CurveSample(currentBall); CurveAnalyse() end
+        if S.CurveDetect then CurveSample(currentBall); CurveAnalyse() end
         UpdateAero(currentBall)
     end
 
-    -- FIX: CPS measurement uses while loop to drain all elapsed seconds correctly.
+    -- CPS meter
     cpsMeasTimer = cpsMeasTimer + dt
-    if cpsMeasTimer >= 1 then
-        cpsActual = cpsFireBucket; cpsFireBucket = 0
-        while cpsMeasTimer >= 1 do cpsMeasTimer = cpsMeasTimer - 1 end
+    while cpsMeasTimer >= 1 do
+        cpsActual = cpsFireBucket; cpsFireBucket = 0; cpsMeasTimer = cpsMeasTimer - 1
     end
 
-    -- ── Triggerbot mode ──────────────────────────────────────────
+    -- Anti-curve expiry (single-shot, just clear the flag)
+    if antiActive and tick() >= antiExpiry then antiActive = false end
+
+    -- ── Triggerbot ────────────────────────────────────────────────
     if tbActive then
         local ball = currentBall; local hrp = cachedHRP
-        if ball and ball.Parent and hrp then
-            if ball:GetAttribute("target") == LP.Name and ApproachStraight(ball, hrp) then
-                local cps = S.TBUseExp and S.TBExpCps or S.TBCps
-                local now = tick()
-                if now - tbLastFire >= 1 / math.max(cps, 1) then
-                    tbLastFire = now; FireParryCPS()
-                end
+        if ball and ball.Parent and hrp and ball:GetAttribute("target") == LP.Name then
+            local cps = S.TBUseExp and S.TBExpCps or S.TBCps
+            local now = tick()
+            if now - tbLastFire >= 1 / math.max(cps, 1) then
+                tbLastFire = now; cpsFireBucket = cpsFireBucket + 1
+                FireParry()
             end
         end
         return
@@ -531,78 +515,81 @@ Track(RunService.PreSimulation:Connect(function(dt)
 
     if not S.AutoParry then return end
 
-    -- Attempt to recover a lost ball reference
-    if not currentBall or not currentBall.Parent then
+    -- Recover lost ball ref
+    if not (currentBall and currentBall.Parent) then
         local b = GetBall(); if b then BindBall(b) end
     end
-    local ball = currentBall; if not ball or not ball.Parent then return end
+
+    local ball = currentBall; if not (ball and ball.Parent) then return end
     local hrp  = cachedHRP;   if not hrp then return end
-    if ball:GetAttribute("target") ~= LP.Name then return end
 
-    local z   = ball:FindFirstChild("zoomies")
-    local spd = z and z.VectorVelocity.Magnitude or 0
-    local dist = (hrp.Position - ball.Position).Magnitude
-
-    if dist < 1.5 then return end
-    if hasParried  then return end
-
-    -- FIX: Global minimum re-fire gap prevents double-fires even if state somehow resets.
-    if tick() - lastParryTime < MIN_REFIRE_GAP then return end
-
-    if not IsApproaching(ball, hrp) then
-        if inWindow then inWindow = false; fireCount = 0 end
+    -- Belt-and-suspenders: sync state from attribute in case signal was missed
+    local tgt = ball:GetAttribute("target")
+    if tgt == LP.Name then
+        if parryState == IDLE then parryState = ARMED end
+    else
+        if parryState ~= IDLE then parryState = IDLE end
         return
     end
 
-    -- Clash mode: fire once ball is within clash distance
-    if S.ClashMode and dist <= S.ClashDist then
-        FireParry(); hasParried = true; return
+    if parryState ~= ARMED then return end
+
+    local z    = ball:FindFirstChild("zoomies")
+    local spd  = z and z.VectorVelocity.Magnitude or 0
+    local dist = (hrp.Position - ball.Position).Magnitude
+
+    -- Don't react if ball is right on top of us (already past window)
+    if dist < 1.5 then return end
+
+    -- Approach check — ball must actually be coming toward us
+    if not IsApproaching(ball, hrp) then return end
+
+    -- Compute adaptive threshold
+    local threshold = GetThreshold()
+    if S.AutoTiming and spd > 0.5 then
+        -- Distance floor: fire at least S.MinFireDist studs away
+        -- This fixes "too late" on slow or freshly-spawned balls
+        threshold = math.max(threshold, math.min(S.MinFireDist / spd, 2.0))
     end
 
-    -- Slow / static ball: fire when within 5 studs
-    if spd < 1 then
-        if dist <= 5 and fireCount < S.MaxFires then
-            fireCount = fireCount + 1; FireParry(); hasParried = true
+    -- Clash mode: fire immediately once ball is close enough
+    if S.ClashMode and dist <= S.ClashDist then
+        if tick() - lastFired < MIN_REFIRE then return end
+        parryState = FIRED; FireParry(); return
+    end
+
+    -- Static ball: use distance trigger
+    if spd < 0.5 then
+        if dist <= 5 then
+            if tick() - lastFired < MIN_REFIRE then return end
+            parryState = FIRED; FireParry()
         end
         return
     end
 
-    local threshold = GetThreshold()
+    -- Normal TTI-based trigger
     local tti = GetTTI(ball, hrp, dt)
-
-    if tti <= threshold and fireCount < S.MaxFires then
-        inWindow   = true
-        fireCount  = fireCount + 1
-        FireParry()
-        hasParried = true
-    elseif inWindow and tti > threshold + 0.05 then
-        inWindow  = false
-        fireCount = 0
-    end
-
-    -- AntiCurve expiry check (single-shot now, just clear flag here)
-    if antiCurveActive and tick() >= antiCurveExpiry then
-        antiCurveActive = false
+    if tti <= threshold then
+        if tick() - lastFired < MIN_REFIRE then return end
+        parryState = FIRED; FireParry()
     end
 end))
 
--- ══════════════════════════════════ PLAYER ESP ══
+-- ══════════════════════════════════════ ESP ══
 local espData = {}
-local ABILITY_ATTRS = {
+local ABILITY_KEYS = {
     "EquippedAbility","equippedAbility","Ability","ability","AbilityName","abilityName",
     "SelectedAbility","selectedAbility","CurrentAbility","currentAbility",
     "PlayerAbility","playerAbility","skillName","SkillName",
 }
 
-local function ScanAttrs(obj)
+local function ScanAbility(obj)
     if not obj then return nil end
-    for _, n in ipairs(ABILITY_ATTRS) do
-        local v = obj:GetAttribute(n)
+    for _, k in ipairs(ABILITY_KEYS) do
+        local v = obj:GetAttribute(k)
         if v then
             local s = tostring(v)
-            if s ~= "" and s ~= "None" and s ~= "nil" and s ~= "0" and s ~= "false" then
-                return s
-            end
+            if s ~= "" and s ~= "None" and s ~= "nil" and s ~= "0" and s ~= "false" then return s end
         end
     end
     local ok, attrs = pcall(function() return obj:GetAttributes() end)
@@ -611,9 +598,7 @@ local function ScanAttrs(obj)
             local lk = k:lower()
             if lk:find("abilit") or lk:find("skill") or lk:find("power") then
                 local s = tostring(v)
-                if s ~= "" and s ~= "false" and s ~= "0" and s ~= "nil" and s ~= "None" then
-                    return s
-                end
+                if s ~= "" and s ~= "false" and s ~= "0" and s ~= "nil" and s ~= "None" then return s end
             end
         end
     end
@@ -621,366 +606,287 @@ local function ScanAttrs(obj)
 end
 
 local function GetAbility(player)
-    local ab = ScanAttrs(player); if ab then return ab end
+    local ab = ScanAbility(player); if ab then return ab end
     local char = player.Character
     if char then
-        ab = ScanAttrs(char); if ab then return ab end
+        ab = ScanAbility(char); if ab then return ab end
         local hum = char:FindFirstChild("Humanoid")
-        if hum then ab = ScanAttrs(hum); if ab then return ab end end
+        if hum then ab = ScanAbility(hum); if ab then return ab end end
         for _, obj in ipairs(char:GetDescendants()) do
             if obj:IsA("StringValue") then
                 local lk = obj.Name:lower()
                 if (lk:find("abilit") or lk:find("skill") or lk:find("power"))
-                    and obj.Value ~= "" and obj.Value ~= "None" then
-                    return obj.Value
-                end
-            end
-        end
-        for _, f in ipairs(char:GetChildren()) do
-            if f:IsA("Folder") or f:IsA("Configuration") then
-                ab = ScanAttrs(f); if ab then return ab end
-            end
-        end
-    end
-    local ls = player:FindFirstChild("leaderstats")
-    if ls then
-        for _, v in ipairs(ls:GetChildren()) do
-            if v:IsA("StringValue") and v.Value ~= "" then
-                local lk = v.Name:lower()
-                if lk:find("abilit") or lk:find("skill") then return v.Value end
+                    and obj.Value ~= "" and obj.Value ~= "None" then return obj.Value end
             end
         end
     end
     return "—"
 end
 
-local function ClearPlayerESP(player)
+local function ClearESP(player)
     local d = espData[player]; if not d then return end
     for _, c in ipairs(d.conns) do pcall(function() c:Disconnect() end) end
     for _, inst in ipairs(d.instances) do
-        if typeof(inst) == "Instance" and inst.Parent then
-            pcall(function() inst:Destroy() end)
-        end
+        if typeof(inst) == "Instance" and inst.Parent then pcall(function() inst:Destroy() end) end
     end
     espData[player] = nil
 end
 
-local function ClearAllESP()
-    for p in pairs(espData) do ClearPlayerESP(p) end; espData = {}
-end
+local function ClearAllESP() for p in pairs(espData) do ClearESP(p) end; espData = {} end
 
-local function ApplyPlayerESP(player)
-    ClearPlayerESP(player); if player == LP then return end
-    if not S.PlayerNameESP and not S.PlayerAbilityESP then return end
-    local d = { conns = {}, instances = {} }; espData[player] = d
-    local function AddI(o) d.instances[#d.instances + 1] = o end
-    local function AddC(c) d.conns[#d.conns + 1] = c end
+local function BuildESP(player)
+    ClearESP(player); if player == LP then return end
+    if not S.PlayerESP and not S.AbilityESP then return end
+    local d = {conns={}, instances={}}; espData[player] = d
+    local function AI(o) d.instances[#d.instances+1]=o end
+    local function AC(c) d.conns[#d.conns+1]=c end
 
     local function Build(char)
-        -- Clean previous instances for this char
         for _, i in ipairs(d.instances) do
-            if typeof(i) == "Instance" and i.Parent then pcall(function() i:Destroy() end) end
+            if typeof(i)=="Instance" and i.Parent then pcall(function() i:Destroy() end) end
         end
         d.instances = {}
         local head = char:WaitForChild("Head", 5); if not head then return end
         local bb = Instance.new("BillboardGui")
-        bb.Adornee = head; bb.AlwaysOnTop = true; bb.LightInfluence = 0
-        bb.Size = UDim2.new(0, 160, 0, (S.PlayerNameESP and S.PlayerAbilityESP) and 38 or 20)
-        bb.StudsOffset = Vector3.new(0, S.PlayerAbilityESP and 3.4 or 2.8, 0)
-        bb.Parent = head; AddI(bb)
+        bb.Adornee=head; bb.AlwaysOnTop=true; bb.LightInfluence=0
+        bb.Size=UDim2.new(0,160,0,(S.PlayerESP and S.AbilityESP) and 38 or 20)
+        bb.StudsOffset=Vector3.new(0, S.AbilityESP and 3.4 or 2.8, 0)
+        bb.Parent=head; AI(bb)
 
-        if S.PlayerNameESP then
+        if S.PlayerESP then
             local lbl = Instance.new("TextLabel", bb)
-            lbl.Size = UDim2.new(1, 0, 0, 18); lbl.BackgroundTransparency = 1
-            lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 13
-            lbl.TextXAlignment = Enum.TextXAlignment.Center
-            lbl.TextStrokeTransparency = 0.3; lbl.ZIndex = 5
-            lbl.Text = player.DisplayName; AddI(lbl)
-            -- FIX: store connection per-label so it can be cleaned up on char change
-            local lastC = 0
-            local nameCon = RunService.Heartbeat:Connect(function()
+            lbl.Size=UDim2.new(1,0,0,18); lbl.BackgroundTransparency=1
+            lbl.Font=Enum.Font.GothamBold; lbl.TextSize=13
+            lbl.TextXAlignment=Enum.TextXAlignment.Center
+            lbl.TextStrokeTransparency=0.3; lbl.ZIndex=5
+            lbl.Text=player.DisplayName; AI(lbl)
+            local lastT=0
+            AC(RunService.Heartbeat:Connect(function()
                 if not lbl.Parent then return end
-                local now = tick(); if now - lastC < 0.1 then return end; lastC = now
-                local ball = currentBall
-                lbl.TextColor3 = (ball and ball.Parent and ball:GetAttribute("target") == LP.Name)
-                    and Color3.fromRGB(255, 60, 60) or Color3.fromRGB(255, 228, 60)
-            end)
-            AddC(nameCon)
+                local now=tick(); if now-lastT<0.1 then return end; lastT=now
+                local ball=currentBall
+                lbl.TextColor3=(ball and ball.Parent and ball:GetAttribute("target")==LP.Name)
+                    and Color3.fromRGB(255,60,60) or Color3.fromRGB(255,228,60)
+            end))
         end
 
-        if S.PlayerAbilityESP then
+        if S.AbilityESP then
             local al = Instance.new("TextLabel", bb)
-            al.Size = UDim2.new(1, 0, 0, 16)
-            al.Position = UDim2.new(0, 0, 0, S.PlayerNameESP and 20 or 2)
-            al.BackgroundTransparency = 1; al.Font = Enum.Font.Gotham; al.TextSize = 11
-            al.TextXAlignment = Enum.TextXAlignment.Center
-            al.TextColor3 = Color3.fromRGB(160, 228, 255)
-            al.TextStrokeTransparency = 0.45; al.ZIndex = 5; AddI(al)
-            local lastA = 0
-            local abCon = RunService.Heartbeat:Connect(function()
+            al.Size=UDim2.new(1,0,0,16)
+            al.Position=UDim2.new(0,0,0,S.PlayerESP and 20 or 2)
+            al.BackgroundTransparency=1; al.Font=Enum.Font.Gotham; al.TextSize=11
+            al.TextXAlignment=Enum.TextXAlignment.Center
+            al.TextColor3=Color3.fromRGB(160,228,255)
+            al.TextStrokeTransparency=0.45; al.ZIndex=5; AI(al)
+            local lastA=0
+            AC(RunService.Heartbeat:Connect(function()
                 if not al.Parent then return end
-                local now = tick(); if now - lastA < 0.4 then return end; lastA = now
-                al.Text = "⚡ " .. GetAbility(player)
-            end)
-            AddC(abCon)
+                local now=tick(); if now-lastA<0.5 then return end; lastA=now
+                al.Text = "⚡ "..GetAbility(player)
+            end))
         end
     end
 
     if player.Character then task.spawn(function() Build(player.Character) end) end
-    AddC(player.CharacterAdded:Connect(function(c)
-        task.wait(0.1); Build(c)
-    end))
+    AC(player.CharacterAdded:Connect(function(c) task.wait(0.1); Build(c) end))
 end
 
-local function ApplyAllESP()
+local function RebuildAllESP()
     ClearAllESP()
-    if not S.PlayerNameESP and not S.PlayerAbilityESP then return end
-    for _, p in ipairs(Players:GetPlayers()) do if p ~= LP then ApplyPlayerESP(p) end end
+    if not S.PlayerESP and not S.AbilityESP then return end
+    for _, p in ipairs(Players:GetPlayers()) do if p ~= LP then BuildESP(p) end end
 end
 
-Track(Players.PlayerAdded:Connect(function(p)
-    if S.PlayerNameESP or S.PlayerAbilityESP then task.wait(0.5); ApplyPlayerESP(p) end
+Con(Players.PlayerAdded:Connect(function(p)
+    if S.PlayerESP or S.AbilityESP then task.wait(0.5); BuildESP(p) end
 end))
-Track(Players.PlayerRemoving:Connect(ClearPlayerESP))
+Con(Players.PlayerRemoving:Connect(ClearESP))
 
--- ══════════════════════════════ Character Trail ══
+-- ═══════════════════════════════════ TRAIL ══
 local function ApplyTrail(char)
     if not char then return end
     local hrp = char:WaitForChild("HumanoidRootPart", 5); if not hrp then return end
     for _, v in ipairs(hrp:GetChildren()) do
-        if v:IsA("Trail") or (v:IsA("Attachment") and v.Name:match("^_trail")) then
-            v:Destroy()
-        end
+        if v:IsA("Trail") or (v:IsA("Attachment") and v.Name:sub(1,6)=="_trail") then v:Destroy() end
     end
     if not S.CharTrail then return end
-    local a0 = Instance.new("Attachment", hrp); a0.Name = "_trail0"; a0.Position = Vector3.new(0, 1, 0)
-    local a1 = Instance.new("Attachment", hrp); a1.Name = "_trail1"; a1.Position = Vector3.new(0, -1, 0)
-    local t  = Instance.new("Trail", hrp)
-    t.Attachment0 = a0; t.Attachment1 = a1; t.Lifetime = 0.4; t.MinLength = 0; t.FaceCamera = true
-    t.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0,   Color3.fromRGB(0, 180, 255)),
-        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(80, 80, 255)),
-        ColorSequenceKeypoint.new(1,   Color3.fromRGB(255, 255, 255)),
+    local a0=Instance.new("Attachment",hrp); a0.Name="_trail0"; a0.Position=Vector3.new(0,1,0)
+    local a1=Instance.new("Attachment",hrp); a1.Name="_trail1"; a1.Position=Vector3.new(0,-1,0)
+    local t=Instance.new("Trail",hrp)
+    t.Attachment0=a0; t.Attachment1=a1; t.Lifetime=0.4; t.MinLength=0; t.FaceCamera=true
+    t.Color=ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   Color3.fromRGB(0,180,255)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(80,80,255)),
+        ColorSequenceKeypoint.new(1,   Color3.fromRGB(255,255,255)),
     })
-    t.Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.1),
-        NumberSequenceKeypoint.new(1, 1),
+    t.Transparency=NumberSequence.new({
+        NumberSequenceKeypoint.new(0,0.1), NumberSequenceKeypoint.new(1,1),
     })
 end
 if LP.Character then ApplyTrail(LP.Character) end
-Track(LP.CharacterAdded:Connect(ApplyTrail))
+Con(LP.CharacterAdded:Connect(ApplyTrail))
 
--- ══════════════════════════════════════ FPS BOOST ENGINE ══
-local FPS = {
-    Shadows=false, Decorations=false, PostFX=false,
-    Fog=false, Particles=false, Textures=false, Quality=false,
-}
-local FPSBK = {}; local fpsBaseline = 0
-local Lighting = game:GetService("Lighting")
+-- ════════════════════════════════ FPS BOOST ══
+local FPS = {Shadows=false,Decorations=false,PostFX=false,Fog=false,Particles=false,Textures=false,Quality=false}
+local FPS_BK = {}; local fpsBaseline = 0
 
-local function FPSShadows(on)
-    if on then
-        if not FPS.Shadows then FPSBK.shadows = Lighting.GlobalShadows end
-        Lighting.GlobalShadows = false; FPS.Shadows = true
-    else
-        Lighting.GlobalShadows = FPSBK.shadows ~= nil and FPSBK.shadows or true
-        FPS.Shadows = false
-    end
+local function FPS_Shadows(on)
+    if on then if not FPS.Shadows then FPS_BK.shadows=Lighting.GlobalShadows end
+              Lighting.GlobalShadows=false; FPS.Shadows=true
+    else Lighting.GlobalShadows=FPS_BK.shadows~=nil and FPS_BK.shadows or true; FPS.Shadows=false end
 end
-local function FPSDecorations(on)
-    local t = workspace:FindFirstChildOfClass("Terrain"); if not t then return end
-    if on then
-        if not FPS.Decorations then FPSBK.deco = t.Decoration end
-        t.Decoration = false; FPS.Decorations = true
-    else
-        t.Decoration = FPSBK.deco ~= nil and FPSBK.deco or true; FPS.Decorations = false
-    end
+local function FPS_Deco(on)
+    local t=workspace:FindFirstChildOfClass("Terrain"); if not t then return end
+    if on then if not FPS.Decorations then FPS_BK.deco=t.Decoration end
+              t.Decoration=false; FPS.Decorations=true
+    else t.Decoration=FPS_BK.deco~=nil and FPS_BK.deco or true; FPS.Decorations=false end
 end
-local function FPSPostFX(on)
+local function FPS_PostFX(on)
     if on then
-        if not FPS.PostFX then
-            FPSBK.postFX = {}
-            for _, fx in ipairs(Lighting:GetChildren()) do
+        if not FPS.PostFX then FPS_BK.postFX={}
+            for _,fx in ipairs(Lighting:GetChildren()) do
                 if fx:IsA("PostEffect") then
-                    FPSBK.postFX[#FPSBK.postFX + 1] = { obj = fx, enabled = fx.Enabled }
-                    fx.Enabled = false
+                    FPS_BK.postFX[#FPS_BK.postFX+1]={obj=fx,en=fx.Enabled}; fx.Enabled=false
                 end
             end
-        end
-        FPS.PostFX = true
+        end; FPS.PostFX=true
     else
-        if FPSBK.postFX then
-            for _, e in ipairs(FPSBK.postFX) do
-                if e.obj and e.obj.Parent then e.obj.Enabled = e.enabled end
-            end
-        end
-        FPS.PostFX = false
+        if FPS_BK.postFX then for _,e in ipairs(FPS_BK.postFX) do
+            if e.obj and e.obj.Parent then e.obj.Enabled=e.en end
+        end end; FPS.PostFX=false
     end
 end
-local function FPSFog(on)
-    if on then
-        if not FPS.Fog then FPSBK.fogEnd = Lighting.FogEnd; FPSBK.fogStart = Lighting.FogStart end
-        Lighting.FogEnd = 9e9; Lighting.FogStart = 9e9; FPS.Fog = true
-    else
-        Lighting.FogEnd = FPSBK.fogEnd or 100000; Lighting.FogStart = FPSBK.fogStart or 0
-        FPS.Fog = false
-    end
+local function FPS_Fog(on)
+    if on then if not FPS.Fog then FPS_BK.fogEnd=Lighting.FogEnd; FPS_BK.fogStart=Lighting.FogStart end
+              Lighting.FogEnd=9e9; Lighting.FogStart=9e9; FPS.Fog=true
+    else Lighting.FogEnd=FPS_BK.fogEnd or 1e5; Lighting.FogStart=FPS_BK.fogStart or 0; FPS.Fog=false end
 end
-local function FPSParticles(on)
+local function FPS_Particles(on)
     if on then
-        if not FPS.Particles then
-            FPSBK.particles = {}
-            for _, obj in ipairs(workspace:GetDescendants()) do
-                local tn = obj.ClassName
-                if tn == "ParticleEmitter" or tn == "Trail" or tn == "Beam"
-                    or tn == "Fire" or tn == "Smoke" or tn == "Sparkles" then
-                    FPSBK.particles[#FPSBK.particles + 1] = { obj = obj, enabled = obj.Enabled }
-                    obj.Enabled = false
+        if not FPS.Particles then FPS_BK.particles={}
+            for _,obj in ipairs(workspace:GetDescendants()) do
+                local cn=obj.ClassName
+                if cn=="ParticleEmitter" or cn=="Trail" or cn=="Beam"
+                or cn=="Fire" or cn=="Smoke" or cn=="Sparkles" then
+                    FPS_BK.particles[#FPS_BK.particles+1]={obj=obj,en=obj.Enabled}; obj.Enabled=false
                 end
             end
-        end
-        FPS.Particles = true
-        if not FPSBK.particleConn then
-            FPSBK.particleConn = workspace.DescendantAdded:Connect(function(obj)
+        end; FPS.Particles=true
+        if not FPS_BK.partConn then
+            FPS_BK.partConn=workspace.DescendantAdded:Connect(function(obj)
                 if not FPS.Particles then return end
-                local tn = obj.ClassName
-                if tn == "ParticleEmitter" or tn == "Trail" or tn == "Beam"
-                    or tn == "Fire" or tn == "Smoke" or tn == "Sparkles" then
-                    obj.Enabled = false
-                end
+                local cn=obj.ClassName
+                if cn=="ParticleEmitter" or cn=="Trail" or cn=="Beam"
+                or cn=="Fire" or cn=="Smoke" or cn=="Sparkles" then obj.Enabled=false end
             end)
         end
     else
-        if FPSBK.particles then
-            for _, e in ipairs(FPSBK.particles) do
-                if e.obj and e.obj.Parent then e.obj.Enabled = e.enabled end
-            end
-        end
-        if FPSBK.particleConn then FPSBK.particleConn:Disconnect(); FPSBK.particleConn = nil end
-        FPS.Particles = false
+        if FPS_BK.particles then for _,e in ipairs(FPS_BK.particles) do
+            if e.obj and e.obj.Parent then e.obj.Enabled=e.en end
+        end end
+        if FPS_BK.partConn then FPS_BK.partConn:Disconnect(); FPS_BK.partConn=nil end
+        FPS.Particles=false
     end
 end
-local function FPSTextures(on)
+local function FPS_Textures(on)
     if on then
-        if not FPS.Textures then
-            FPSBK.textures = {}
-            for _, obj in ipairs(workspace:GetDescendants()) do
+        if not FPS.Textures then FPS_BK.textures={}
+            for _,obj in ipairs(workspace:GetDescendants()) do
                 if obj:IsA("Decal") or obj:IsA("Texture") then
-                    FPSBK.textures[#FPSBK.textures + 1] = { obj = obj, tid = obj.Texture }
-                    obj.Texture = ""
-                elseif obj:IsA("SpecialMesh") and obj.MeshType == Enum.MeshType.FileMesh then
-                    FPSBK.textures[#FPSBK.textures + 1] = { obj = obj, tid = obj.TextureId }
-                    obj.TextureId = ""
+                    FPS_BK.textures[#FPS_BK.textures+1]={obj=obj,tid=obj.Texture}; obj.Texture=""
+                elseif obj:IsA("SpecialMesh") and obj.MeshType==Enum.MeshType.FileMesh then
+                    FPS_BK.textures[#FPS_BK.textures+1]={obj=obj,tid=obj.TextureId}; obj.TextureId=""
                 end
             end
-        end
-        FPS.Textures = true
+        end; FPS.Textures=true
     else
-        if FPSBK.textures then
-            for _, e in ipairs(FPSBK.textures) do
-                if e.obj and e.obj.Parent then
-                    if e.obj:IsA("SpecialMesh") then e.obj.TextureId = e.tid
-                    else e.obj.Texture = e.tid end
-                end
+        if FPS_BK.textures then for _,e in ipairs(FPS_BK.textures) do
+            if e.obj and e.obj.Parent then
+                if e.obj:IsA("SpecialMesh") then e.obj.TextureId=e.tid else e.obj.Texture=e.tid end
             end
-        end
-        FPS.Textures = false
+        end end; FPS.Textures=false
     end
 end
-local function FPSQuality(on)
+local function FPS_Quality(on)
     if on then
-        if not FPS.Quality then
-            pcall(function() FPSBK.quality = settings().Rendering.QualityLevel end)
-        end
-        pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
-        FPS.Quality = true
+        if not FPS.Quality then pcall(function() FPS_BK.quality=settings().Rendering.QualityLevel end) end
+        pcall(function() settings().Rendering.QualityLevel=Enum.QualityLevel.Level01 end); FPS.Quality=true
     else
-        pcall(function()
-            settings().Rendering.QualityLevel = FPSBK.quality or Enum.QualityLevel.Automatic
-        end)
-        FPS.Quality = false
+        pcall(function() settings().Rendering.QualityLevel=FPS_BK.quality or Enum.QualityLevel.Automatic end)
+        FPS.Quality=false
     end
 end
 
-local FPS_DISPATCH = {
-    Shadows=FPSShadows, Decorations=FPSDecorations, PostFX=FPSPostFX,
-    Fog=FPSFog, Particles=FPSParticles, Textures=FPSTextures, Quality=FPSQuality,
-}
-local function SetFPSFeature(name, on) local fn = FPS_DISPATCH[name]; if fn then fn(on) end end
-
+local FPS_FUNCS = {Shadows=FPS_Shadows,Decorations=FPS_Deco,PostFX=FPS_PostFX,
+                   Fog=FPS_Fog,Particles=FPS_Particles,Textures=FPS_Textures,Quality=FPS_Quality}
+local function SetFPS(k,v) local f=FPS_FUNCS[k]; if f then f(v) end end
 local function NukeAll()
-    if fpsBaseline == 0 then fpsBaseline = rawFPS end  -- FIX: capture baseline before first nuke
-    for n in pairs(FPS_DISPATCH) do SetFPSFeature(n, true) end
-    if _G.__Z0M_RefreshFPS then _G.__Z0M_RefreshFPS() end
+    if fpsBaseline==0 then fpsBaseline=rawFPS end
+    for k in pairs(FPS_FUNCS) do SetFPS(k,true) end
+    if _G.__Z0M_SyncFPS then _G.__Z0M_SyncFPS() end
 end
 local function RestoreAll()
-    for n in pairs(FPS_DISPATCH) do SetFPSFeature(n, false) end
-    if _G.__Z0M_RefreshFPS then _G.__Z0M_RefreshFPS() end
+    for k in pairs(FPS_FUNCS) do SetFPS(k,false) end
+    if _G.__Z0M_SyncFPS then _G.__Z0M_SyncFPS() end
 end
 
--- ════════════════════════════════════ Config ══
+-- ═══════════════════════════════════ CONFIG ══
 local CONFIG_FILE  = "z0mware_configs.json"
 local CONFIG_SLOTS = 5
 local configs      = {}
 local CONFIG_KEYS  = {
-    "AutoParry","AutoTiming","ClashMode","CurveDetection","AutoCurve","AntiCurve",
-    "TriggerTime","ClashDist","MaxFires","ACSnapDur","AntiCurveDur",
-    "PlayerNameESP","PlayerAbilityESP","CharTrail",
-    "TBEnabled","TBMode","TBCps","TBExpCps","TBUseExp","ShowCPSCounter",
+    "AutoParry","AutoTiming","TriggerTime","MinFireDist","ClashMode","ClashDist",
+    "CurveDetect","AutoCurve","ACSnapDur","AntiCurve","AntiCurveDur",
+    "AeroDetect","AeroBoost","AeroDecay",
+    "PlayerESP","AbilityESP","CharTrail",
+    "TBEnabled","TBMode","TBCps","TBExpCps","TBUseExp","ShowCPS",
 }
 
 local function SerializeS()
-    local t = {}
-    for _, k in ipairs(CONFIG_KEYS) do t[k] = S[k] end
-    t.TBKey   = tostring(S.TBKey)
-    t.MenuKey = tostring(S.MenuKey)
-    return t
+    local t={}; for _,k in ipairs(CONFIG_KEYS) do t[k]=S[k] end
+    t.TBKey=tostring(S.TBKey); t.MenuKey=tostring(S.MenuKey); return t
 end
-
-local function DeserializeIntoS(t)
-    for _, k in ipairs(CONFIG_KEYS) do if t[k] ~= nil then S[k] = t[k] end end
-    for _, f in ipairs({ "TBKey","MenuKey" }) do
+local function DeserializeS(t)
+    for _,k in ipairs(CONFIG_KEYS) do if t[k]~=nil then S[k]=t[k] end end
+    for _,f in ipairs({"TBKey","MenuKey"}) do
         if t[f] then
-            local s = tostring(t[f]):gsub("Enum%.KeyCode%.","")
-            local ok, v = pcall(function() return Enum.KeyCode[s] end)
-            if ok and v then S[f] = v end
+            local s=tostring(t[f]):gsub("Enum%.KeyCode%.","")
+            local ok,v=pcall(function() return Enum.KeyCode[s] end)
+            if ok and v then S[f]=v end
         end
     end
 end
 
 local function LoadConfigs()
-    local ok, data = pcall(function()
+    local ok,data=pcall(function()
         if readfile then return HttpService:JSONDecode(readfile(CONFIG_FILE)) end
         return nil
     end)
-    configs = (ok and type(data) == "table") and data or {}
-    for i = 1, CONFIG_SLOTS do
-        if not configs[i] then configs[i] = { name = "Slot " .. i, data = nil } end
+    configs=(ok and type(data)=="table") and data or {}
+    for i=1,CONFIG_SLOTS do
+        if not configs[i] then configs[i]={name="Slot "..i,data=nil} end
     end
 end
-
 local function SaveConfigs()
-    pcall(function()
-        if writefile then writefile(CONFIG_FILE, HttpService:JSONEncode(configs)) end
-    end)
+    pcall(function() if writefile then writefile(CONFIG_FILE,HttpService:JSONEncode(configs)) end end)
 end
 LoadConfigs()
 
--- ══════════════════════════════════════════ GUI ══
+-- ═══════════════════════════════════════════ GUI ══
 local pgui = LP:WaitForChild("PlayerGui")
-local function GuiParent()
-    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+local function GuiRoot()
+    local ok,cg=pcall(function() return game:GetService("CoreGui") end)
     return ok and cg or pgui
 end
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name            = "z0mware_v20"
-ScreenGui.ResetOnSpawn    = false
-ScreenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
-ScreenGui.IgnoreGuiInset  = true
-ScreenGui.Parent          = GuiParent()
+ScreenGui.Name           = "z0mware_v30"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.Parent         = GuiRoot()
 
--- ── Color palette ──────────────────────────────────────────────
+-- ── Palette ──────────────────────────────────────────────────────
 local C = {
     bg      = Color3.fromRGB(6,7,12),
     panel   = Color3.fromRGB(13,14,22),
@@ -992,9 +898,8 @@ local C = {
     accent2 = Color3.fromRGB(110,65,230),
     green   = Color3.fromRGB(55,205,85),
     red     = Color3.fromRGB(255,60,60),
-    blue    = Color3.fromRGB(75,185,255),
     text    = Color3.fromRGB(210,208,200),
-    subtext = Color3.fromRGB(105,100,90),
+    sub     = Color3.fromRGB(105,100,90),
     track   = Color3.fromRGB(28,28,42),
     div     = Color3.fromRGB(22,22,36),
     orange  = Color3.fromRGB(255,135,25),
@@ -1002,1367 +907,1085 @@ local C = {
     cyan    = Color3.fromRGB(55,225,225),
     teal    = Color3.fromRGB(30,210,175),
     lime    = Color3.fromRGB(140,230,60),
-    pink    = Color3.fromRGB(255,90,180),
+    yellow  = Color3.fromRGB(255,228,50),
+    blue    = Color3.fromRGB(75,185,255),
 }
 
-local W          = isMobile and 350 or 390
-local H_FULL     = isMobile and 490 or 450
-local H_MIN      = 40
-local HEADER_H   = H_MIN
-local TAB_H      = isMobile and 36 or 30
-local CONTENT_TOP = HEADER_H + TAB_H
-
-local Main  -- forward declare
-
--- ════════════════════════════ FLOATING MENU BUTTON ══
-local ToggleBtn = Instance.new("TextButton", ScreenGui)
-ToggleBtn.Name              = "Z0M_ToggleBtn"
-ToggleBtn.Size              = UDim2.new(0, 52, 0, 52)
-ToggleBtn.Position          = isMobile and UDim2.new(1,-70,1,-148) or UDim2.new(1,-66,0,58)
-ToggleBtn.BackgroundColor3  = Color3.fromRGB(10,11,20)
-ToggleBtn.BorderSizePixel   = 0
-ToggleBtn.Font              = Enum.Font.GothamBold
-ToggleBtn.TextSize          = 22
-ToggleBtn.Text              = "⚡"
-ToggleBtn.TextColor3        = C.accent
-ToggleBtn.AutoButtonColor   = false
-ToggleBtn.ZIndex            = 50
-ToggleBtn.Active            = true
-Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(1, 0)
-local _tSt = Instance.new("UIStroke", ToggleBtn)
-_tSt.Color = C.accent2; _tSt.Thickness = 1.5; _tSt.Transparency = 0.3
-
-do  -- draggable toggle btn
-    -- FIX: moved reset on each InputBegan (was sticky across touches on mobile)
-    local activeInput = nil; local dragStart, startPos; local moved = false
-    local DRAG_THRESH = isMobile and 20 or 12
-    ToggleBtn.InputBegan:Connect(function(input)
-        if activeInput then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        activeInput = input; dragStart = input.Position
-        startPos = ToggleBtn.Position; moved = false  -- reset here
-    end)
-    ToggleBtn.InputChanged:Connect(function(input)
-        if input ~= activeInput then return end
-        local d = input.Position - dragStart
-        if d.Magnitude > DRAG_THRESH then moved = true end
-        ToggleBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-            startPos.Y.Scale, startPos.Y.Offset + d.Y)
-    end)
-    ToggleBtn.InputEnded:Connect(function(input)
-        if input == activeInput then activeInput = nil end
-    end)
-    ToggleBtn.MouseButton1Click:Connect(function()
-        if moved then return end
-        if Main then
-            Main.Visible = not Main.Visible
-            TweenService:Create(ToggleBtn, TweenInfo.new(0.12), {
-                BackgroundColor3 = Main.Visible and Color3.fromRGB(18,20,42) or Color3.fromRGB(10,11,20)
-            }):Play()
-        end
-    end)
-end
-
--- ════════════════════════════ MOBILE TRIGGERBOT BUTTON ══
-local MobileTBBtn = nil
-if isMobile then
-    MobileTBBtn = Instance.new("TextButton", ScreenGui)
-    MobileTBBtn.Name              = "Z0M_MobileTBBtn"
-    MobileTBBtn.Size              = UDim2.new(0, 160, 0, 56)
-    MobileTBBtn.Position          = UDim2.new(0, 14, 1, -178)
-    MobileTBBtn.BackgroundColor3  = Color3.fromRGB(28,8,8)
-    MobileTBBtn.BorderSizePixel   = 0
-    MobileTBBtn.Font              = Enum.Font.GothamBold
-    MobileTBBtn.TextSize          = 11
-    MobileTBBtn.TextLineHeight    = 1.3
-    MobileTBBtn.Text              = "TRIGGERBOT\nTAP TO TOGGLE"
-    MobileTBBtn.TextColor3        = Color3.fromRGB(255,80,80)
-    MobileTBBtn.AutoButtonColor   = false
-    MobileTBBtn.ZIndex            = 50
-    MobileTBBtn.Active            = true
-    Instance.new("UICorner", MobileTBBtn).CornerRadius = UDim.new(0, 28)
-
-    local _mbGrad = Instance.new("UIGradient", MobileTBBtn)
-    _mbGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(38,10,10)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(18,6,6)),
-    }); _mbGrad.Rotation = 90
-
-    local _mbStroke = Instance.new("UIStroke", MobileTBBtn)
-    _mbStroke.Color = Color3.fromRGB(200,40,40); _mbStroke.Thickness = 1.5; _mbStroke.Transparency = 0.25
-
-    local _mbDot = Instance.new("Frame", MobileTBBtn)
-    _mbDot.Name = "_dot"; _mbDot.Size = UDim2.new(0,8,0,8)
-    _mbDot.Position = UDim2.new(0,14,0.5,-4)
-    _mbDot.BackgroundColor3 = Color3.fromRGB(200,40,40); _mbDot.BorderSizePixel = 0; _mbDot.ZIndex = 51
-    Instance.new("UICorner", _mbDot).CornerRadius = UDim.new(1, 0)
-
-    local function RefreshMobileTB()
-        if tbActive then
-            MobileTBBtn.Text       = "TRIGGERBOT\nACTIVE  ✓"
-            MobileTBBtn.TextColor3 = Color3.fromRGB(80,230,110)
-            _mbGrad.Color = ColorSequence.new({
-                ColorSequenceKeypoint.new(0, Color3.fromRGB(10,42,18)),
-                ColorSequenceKeypoint.new(1, Color3.fromRGB(6,22,10)),
-            })
-            _mbStroke.Color = Color3.fromRGB(55,205,85); _mbStroke.Transparency = 0.2
-            _mbDot.BackgroundColor3 = Color3.fromRGB(55,205,85)
-        else
-            MobileTBBtn.Text       = "TRIGGERBOT\nTAP TO TOGGLE"
-            MobileTBBtn.TextColor3 = Color3.fromRGB(255,80,80)
-            _mbGrad.Color = ColorSequence.new({
-                ColorSequenceKeypoint.new(0, Color3.fromRGB(38,10,10)),
-                ColorSequenceKeypoint.new(1, Color3.fromRGB(18,6,6)),
-            })
-            _mbStroke.Color = Color3.fromRGB(200,40,40); _mbStroke.Transparency = 0.25
-            _mbDot.BackgroundColor3 = Color3.fromRGB(200,40,40)
-        end
-    end
-    _G.__Z0M_RefreshMobileTB = RefreshMobileTB
-
-    do  -- draggable mobile TB btn
-        -- FIX: moved reset on InputBegan so each new touch starts clean
-        local activeInput = nil; local dragStart, startPos; local moved = false
-        local DRAG_THRESH = 20
-        MobileTBBtn.InputBegan:Connect(function(input)
-            if activeInput then return end
-            if input.UserInputType ~= Enum.UserInputType.MouseButton1
-                and input.UserInputType ~= Enum.UserInputType.Touch then return end
-            activeInput = input; dragStart = input.Position
-            startPos = MobileTBBtn.Position; moved = false  -- reset here
-        end)
-        MobileTBBtn.InputChanged:Connect(function(input)
-            if input ~= activeInput then return end
-            local d = input.Position - dragStart
-            if d.Magnitude > DRAG_THRESH then moved = true end
-            MobileTBBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y)
-        end)
-        MobileTBBtn.InputEnded:Connect(function(input)
-            if input == activeInput then activeInput = nil end
-        end)
-        MobileTBBtn.MouseButton1Click:Connect(function()
-            if moved then return end
-            if not S.TBEnabled then return end
-            if tbActive then DeactivateTriggerbot() else ActivateTriggerbot() end
-            RefreshMobileTB()
-            TweenService:Create(MobileTBBtn, TweenInfo.new(0.08), {Size=UDim2.new(0,152,0,52)}):Play()
-            task.delay(0.08, function()
-                TweenService:Create(MobileTBBtn, TweenInfo.new(0.12,Enum.EasingStyle.Back),
-                    {Size=UDim2.new(0,160,0,56)}):Play()
-            end)
-        end)
-    end
-end
-
--- ════════════════════════════════════ MAIN PANEL ══
-Main = Instance.new("Frame", ScreenGui)
-Main.Name             = "MainPanel"
-Main.Size             = UDim2.new(0, W, 0, H_FULL)
-Main.Position         = isMobile
-    and UDim2.new(0.5, -W/2, 0.5, -H_FULL/2)
-    or  UDim2.new(0, 20, 0.5, -H_FULL/2)
-Main.BackgroundColor3 = C.bg
-Main.BorderSizePixel  = 0
-Main.Active           = true
-Main.ClipsDescendants = true
-Main.Visible          = false
-Main.ZIndex           = 10
-Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
-local _ms = Instance.new("UIStroke", Main)
-_ms.Color = C.accent2; _ms.Thickness = 1; _ms.Transparency = 0.4
-
-local AccBar = Instance.new("Frame", Main)
-AccBar.Size = UDim2.new(0, 3, 1, 0); AccBar.BorderSizePixel = 0; AccBar.ZIndex = 4
-local _ag = Instance.new("UIGradient", AccBar)
-_ag.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0,   Color3.fromRGB(110,65,230)),
-    ColorSequenceKeypoint.new(0.4, Color3.fromRGB(80,190,255)),
-    ColorSequenceKeypoint.new(0.7, Color3.fromRGB(30,210,175)),
-    ColorSequenceKeypoint.new(1,   Color3.fromRGB(255,60,60)),
-}); _ag.Rotation = 90
-
-local Header = Instance.new("Frame", Main)
-Header.Name = "Header"; Header.Size = UDim2.new(1,0,0,HEADER_H)
-Header.BackgroundColor3 = C.header; Header.BorderSizePixel = 0; Header.ZIndex = 3
-
-local TitleLbl = Instance.new("TextLabel", Header)
-TitleLbl.Size = UDim2.new(1,-80,1,0); TitleLbl.Position = UDim2.new(0,14,0,0)
-TitleLbl.BackgroundTransparency = 1; TitleLbl.Text = "⚡  z0mware  v2.0"
-TitleLbl.Font = Enum.Font.GothamBold; TitleLbl.TextSize = isMobile and 15 or 14
-TitleLbl.TextColor3 = C.accent; TitleLbl.TextXAlignment = Enum.TextXAlignment.Left; TitleLbl.ZIndex = 4
-
-local MinBtn = Instance.new("TextButton", Header)
-MinBtn.Size = UDim2.new(0,28,0,24); MinBtn.Position = UDim2.new(1,-64,0.5,-12)
-MinBtn.BackgroundColor3 = C.panel; MinBtn.BorderSizePixel = 0; MinBtn.Font = Enum.Font.GothamBold
-MinBtn.TextSize = 14; MinBtn.TextColor3 = C.subtext; MinBtn.Text = "─"
-MinBtn.AutoButtonColor = false; MinBtn.ZIndex = 5
-Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 6)
-
-local CloseBtn = Instance.new("TextButton", Header)
-CloseBtn.Size = UDim2.new(0,28,0,24); CloseBtn.Position = UDim2.new(1,-32,0.5,-12)
-CloseBtn.BackgroundColor3 = Color3.fromRGB(160,28,28); CloseBtn.BorderSizePixel = 0
-CloseBtn.Font = Enum.Font.GothamBold; CloseBtn.TextSize = 14
-CloseBtn.TextColor3 = Color3.new(1,1,1); CloseBtn.Text = "✕"
-CloseBtn.AutoButtonColor = false; CloseBtn.ZIndex = 5
-Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
-
-local TabBar = Instance.new("Frame", Main)
-TabBar.Name = "TabBar"; TabBar.Size = UDim2.new(1,0,0,TAB_H)
-TabBar.Position = UDim2.new(0,0,0,HEADER_H)
-TabBar.BackgroundColor3 = C.tabBar; TabBar.BorderSizePixel = 0; TabBar.ZIndex = 3
-local _tbl = Instance.new("UIListLayout", TabBar)
-_tbl.FillDirection = Enum.FillDirection.Horizontal
-_tbl.HorizontalAlignment = Enum.HorizontalAlignment.Left
-_tbl.SortOrder = Enum.SortOrder.LayoutOrder
-
--- ── Drag helper ──────────────────────────────────────────────────
-local function MakeDraggable(frame, handle)
-    handle = handle or frame
-    local activeInput = nil; local dragStart, startPos
-    handle.InputBegan:Connect(function(input)
-        if activeInput then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        activeInput = input; dragStart = input.Position; startPos = frame.Position
-    end)
-    handle.InputChanged:Connect(function(input)
-        if input ~= activeInput then return end
-        local d = input.Position - dragStart
-        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-            startPos.Y.Scale, startPos.Y.Offset + d.Y)
-    end)
-    handle.InputEnded:Connect(function(input)
-        if input == activeInput then activeInput = nil end
-    end)
-end
-MakeDraggable(Main, Header)
+-- ── Layout constants ─────────────────────────────────────────────
+local W    = isMobile and 350 or 390
+local HFUL = isMobile and 490 or 460
+local HMIN = 40
+local HDR  = HMIN
+local TABH = isMobile and 36 or 30
+local CTOP = HDR + TABH
 
 -- ── Widget helpers ───────────────────────────────────────────────
-local sliderRefs = {}
+local sliderRefs = {}  -- key → SetVal(v) function
 
-local function MakeDivider(p, order)
-    local d = Instance.new("Frame", p)
-    d.Size = UDim2.new(0.9,0,0,1); d.BackgroundColor3 = C.div
-    d.BorderSizePixel = 0; d.LayoutOrder = order
+local function Corner(r, p) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r); return c end
+local function Stroke(col, th, p) local s=Instance.new("UIStroke",p); s.Color=col; s.Thickness=th; return s end
+local function Grad(cs, rot, p) local g=Instance.new("UIGradient",p); g.Color=cs; g.Rotation=rot; return g end
+
+local function Div(p, ord)
+    local d=Instance.new("Frame",p); d.Size=UDim2.new(0.92,0,0,1)
+    d.BackgroundColor3=C.div; d.BorderSizePixel=0; d.LayoutOrder=ord
 end
 
-local function MakeSection(p, txt, order)
-    local l = Instance.new("TextLabel", p)
-    l.Size = UDim2.new(0.9,0,0,18); l.BackgroundTransparency = 1
-    l.Font = Enum.Font.GothamBold; l.TextSize = 10; l.TextColor3 = C.subtext
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.Text = txt:upper(); l.LayoutOrder = order; l.ZIndex = 3
+local function Section(p, txt, ord)
+    local l=Instance.new("TextLabel",p); l.Size=UDim2.new(0.92,0,0,16)
+    l.BackgroundTransparency=1; l.Font=Enum.Font.GothamBold; l.TextSize=9
+    l.TextColor3=C.sub; l.TextXAlignment=Enum.TextXAlignment.Left
+    l.Text=txt:upper(); l.LayoutOrder=ord; l.ZIndex=3
 end
 
-local TOGGLE_H = isMobile and 46 or 38
+local function InfoLbl(p, col, ord, h)
+    local l=Instance.new("TextLabel",p); l.Size=UDim2.new(0.92,0,0,h or 14)
+    l.BackgroundTransparency=1; l.Font=Enum.Font.Gotham; l.TextSize=11
+    l.TextColor3=col or C.sub; l.TextXAlignment=Enum.TextXAlignment.Left
+    l.LayoutOrder=ord; l.ZIndex=3; return l
+end
 
-local function MakeToggle(p, label, getV, setV, onColor, order, onChange)
-    local Row = Instance.new("Frame", p)
-    Row.Size = UDim2.new(0.9,0,0,TOGGLE_H); Row.BackgroundColor3 = C.panel
-    Row.BorderSizePixel = 0; Row.LayoutOrder = order
-    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 8)
-    local Lbl = Instance.new("TextLabel", Row)
-    Lbl.Size = UDim2.new(1,-60,1,0); Lbl.Position = UDim2.new(0,12,0,0)
-    Lbl.BackgroundTransparency = 1; Lbl.Font = Enum.Font.Gotham
-    Lbl.TextSize = isMobile and 14 or 12; Lbl.TextColor3 = C.text
-    Lbl.TextXAlignment = Enum.TextXAlignment.Left; Lbl.Text = label; Lbl.ZIndex = 3
-    local Trk = Instance.new("Frame", Row)
-    Trk.Size = UDim2.new(0,38,0,22); Trk.Position = UDim2.new(1,-50,0.5,-11)
-    Trk.BackgroundColor3 = getV() and onColor or C.track; Trk.BorderSizePixel = 0
-    Instance.new("UICorner", Trk).CornerRadius = UDim.new(1, 0)
-    local Knob = Instance.new("Frame", Trk)
-    Knob.Size = UDim2.new(0,16,0,16)
-    Knob.Position = getV() and UDim2.new(1,-19,0.5,-8) or UDim2.new(0,3,0.5,-8)
-    Knob.BackgroundColor3 = Color3.fromRGB(240,238,228); Knob.BorderSizePixel = 0
-    Instance.new("UICorner", Knob).CornerRadius = UDim.new(1, 0)
-    local Hit = Instance.new("TextButton", Row)
-    Hit.Size = UDim2.new(1,0,1,0); Hit.BackgroundTransparency = 1; Hit.Text = ""; Hit.ZIndex = 5
+local TH = isMobile and 46 or 38
+
+local function MakeToggle(p, label, getV, setV, onCol, ord, onChange)
+    local Row=Instance.new("Frame",p)
+    Row.Size=UDim2.new(0.92,0,0,TH); Row.BackgroundColor3=C.panel
+    Row.BorderSizePixel=0; Row.LayoutOrder=ord; Corner(8,Row)
+    local Lbl=Instance.new("TextLabel",Row)
+    Lbl.Size=UDim2.new(1,-60,1,0); Lbl.Position=UDim2.new(0,12,0,0)
+    Lbl.BackgroundTransparency=1; Lbl.Font=Enum.Font.Gotham
+    Lbl.TextSize=isMobile and 14 or 12; Lbl.TextColor3=C.text
+    Lbl.TextXAlignment=Enum.TextXAlignment.Left; Lbl.Text=label; Lbl.ZIndex=3
+    local Trk=Instance.new("Frame",Row)
+    Trk.Size=UDim2.new(0,38,0,20); Trk.Position=UDim2.new(1,-50,0.5,-10)
+    Trk.BackgroundColor3=getV() and onCol or C.track; Trk.BorderSizePixel=0; Corner(10,Trk)
+    local Knob=Instance.new("Frame",Trk)
+    Knob.Size=UDim2.new(0,14,0,14)
+    Knob.Position=getV() and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7)
+    Knob.BackgroundColor3=Color3.fromRGB(240,238,228); Knob.BorderSizePixel=0; Corner(7,Knob)
+    local Hit=Instance.new("TextButton",Row)
+    Hit.Size=UDim2.new(1,0,1,0); Hit.BackgroundTransparency=1; Hit.Text=""; Hit.ZIndex=5
     local function Sync(on)
-        TweenService:Create(Trk, TweenInfo.new(0.15), {BackgroundColor3 = on and onColor or C.track}):Play()
-        TweenService:Create(Knob, TweenInfo.new(0.15), {
-            Position = on and UDim2.new(1,-19,0.5,-8) or UDim2.new(0,3,0.5,-8)
+        TweenService:Create(Trk,TweenInfo.new(0.14),{BackgroundColor3=on and onCol or C.track}):Play()
+        TweenService:Create(Knob,TweenInfo.new(0.14),{
+            Position=on and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7)
         }):Play()
     end
     Hit.MouseButton1Click:Connect(function()
-        local on = not getV(); setV(on); Sync(on); if onChange then onChange(on) end
+        local on=not getV(); setV(on); Sync(on); if onChange then onChange(on) end
     end)
     return Sync
 end
 
-local function MakeSlider(p, label, key, minV, maxV, fmt, lockWhen, order)
-    local h = isMobile and 64 or 52
-    local Row = Instance.new("Frame", p)
-    Row.Size = UDim2.new(0.9,0,0,h); Row.BackgroundColor3 = C.panel
-    Row.BorderSizePixel = 0; Row.LayoutOrder = order
-    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 8)
-    local Lbl = Instance.new("TextLabel", Row)
-    Lbl.Size = UDim2.new(1,-10,0,22); Lbl.Position = UDim2.new(0,12,0,4)
-    Lbl.BackgroundTransparency = 1; Lbl.Font = Enum.Font.Gotham; Lbl.TextSize = 11
-    Lbl.TextXAlignment = Enum.TextXAlignment.Left; Lbl.ZIndex = 3
-
-    local function Locked() return lockWhen and S[lockWhen] end
-    local function UpdLbl(val)
-        Lbl.TextColor3 = Locked() and C.subtext or C.text
-        Lbl.Text = label .. ":  " .. string.format(fmt, val) .. (Locked() and "  [AUTO]" or "")
+-- Slider — uses global _slide (works on PC even when cursor leaves track)
+local function MakeSlider(p, label, key, minV, maxV, fmt, lockKey, ord)
+    local h = isMobile and 62 or 50
+    local Row=Instance.new("Frame",p)
+    Row.Size=UDim2.new(0.92,0,0,h); Row.BackgroundColor3=C.panel
+    Row.BorderSizePixel=0; Row.LayoutOrder=ord; Corner(8,Row)
+    local Lbl=Instance.new("TextLabel",Row)
+    Lbl.Size=UDim2.new(1,-10,0,20); Lbl.Position=UDim2.new(0,12,0,4)
+    Lbl.BackgroundTransparency=1; Lbl.Font=Enum.Font.Gotham; Lbl.TextSize=11
+    Lbl.TextXAlignment=Enum.TextXAlignment.Left; Lbl.ZIndex=3
+    local function Locked() return lockKey and S[lockKey] end
+    local function UpdLbl(v)
+        Lbl.TextColor3=Locked() and C.sub or C.text
+        Lbl.Text=label..":  "..string.format(fmt,v)..(Locked() and "  [AUTO]" or "")
     end
     UpdLbl(S[key])
+    local tH = isMobile and 10 or 5
+    local kSz = isMobile and 22 or 13
+    local TrHit=Instance.new("TextButton",Row)
+    TrHit.Size=UDim2.new(0.86,0,0,isMobile and 30 or 20)
+    TrHit.Position=UDim2.new(0.07,0,1,isMobile and -34 or -24)
+    TrHit.BackgroundTransparency=1; TrHit.Text=""; TrHit.ZIndex=6; TrHit.BorderSizePixel=0
+    local Tr=Instance.new("Frame",TrHit)
+    Tr.Size=UDim2.new(1,0,0,tH); Tr.Position=UDim2.new(0,0,1,-tH)
+    Tr.BackgroundColor3=C.track; Tr.BorderSizePixel=0; Corner(3,Tr)
+    local r0=math.clamp((S[key]-minV)/(maxV-minV),0,1)
+    local Fill=Instance.new("Frame",Tr)
+    Fill.Size=UDim2.new(r0,0,1,0); Fill.BackgroundColor3=C.accent; Fill.BorderSizePixel=0; Corner(3,Fill)
+    local Knob=Instance.new("Frame",Tr)
+    Knob.Size=UDim2.new(0,kSz,0,kSz); Knob.Position=UDim2.new(r0,-kSz/2,0.5,-kSz/2)
+    Knob.BackgroundColor3=C.accent; Knob.BorderSizePixel=0; Knob.ZIndex=5; Corner(kSz,Knob)
 
-    local trackH = isMobile and 10 or 5
-    local TrHit = Instance.new("TextButton", Row)
-    TrHit.Size = UDim2.new(0.86,0,0,isMobile and 32 or 20)
-    TrHit.Position = UDim2.new(0.07,0,1,isMobile and -36 or -26)
-    TrHit.BackgroundTransparency = 1; TrHit.Text = ""; TrHit.ZIndex = 6; TrHit.BorderSizePixel = 0
-    local Tr = Instance.new("Frame", TrHit)
-    Tr.Size = UDim2.new(1,0,0,trackH); Tr.Position = UDim2.new(0,0,1,-trackH)
-    Tr.BackgroundColor3 = C.track; Tr.BorderSizePixel = 0
-    Instance.new("UICorner", Tr).CornerRadius = UDim.new(1, 0)
-    local iR = math.clamp((S[key] - minV) / (maxV - minV), 0, 1)
-    local Fill = Instance.new("Frame", Tr)
-    Fill.Size = UDim2.new(iR,0,1,0)
-    Fill.BackgroundColor3 = Locked() and C.subtext or C.accent; Fill.BorderSizePixel = 0
-    Instance.new("UICorner", Fill).CornerRadius = UDim.new(1, 0)
-    local kSize = isMobile and 24 or 14
-    local Knob = Instance.new("Frame", Tr)
-    Knob.Size = UDim2.new(0,kSize,0,kSize); Knob.Position = UDim2.new(iR,-kSize/2,0.5,-kSize/2)
-    Knob.BackgroundColor3 = Locked() and C.subtext or C.accent
-    Knob.BorderSizePixel = 0; Knob.ZIndex = 5
-    Instance.new("UICorner", Knob).CornerRadius = UDim.new(1, 0)
-
-    local function SetVal(val)
-        local r = math.clamp((val - minV) / (maxV - minV), 0, 1)
-        Fill.Size = UDim2.new(r,0,1,0)
-        Knob.Position = UDim2.new(r,-kSize/2,0.5,-kSize/2)
-        UpdLbl(val)
-        Fill.BackgroundColor3 = Locked() and C.subtext or C.accent
-        Knob.BackgroundColor3 = Locked() and C.subtext or C.accent
+    local function SetVal(v)
+        local r=math.clamp((v-minV)/(maxV-minV),0,1)
+        Fill.Size=UDim2.new(r,0,1,0); Knob.Position=UDim2.new(r,-kSz/2,0.5,-kSz/2)
+        local col=Locked() and C.sub or C.accent
+        Fill.BackgroundColor3=col; Knob.BackgroundColor3=col; UpdLbl(v)
     end
-    sliderRefs[key] = SetVal
+    sliderRefs[key]=SetVal
 
-    local slideInput = nil
-    local function applyPos(screenX)
-        local w = TrHit.AbsoluteSize.X; if w == 0 then return end
-        local r = math.clamp((screenX - TrHit.AbsolutePosition.X) / w, 0, 1)
-        S[key] = math.floor((minV + (maxV - minV) * r) * 1000 + 0.5) / 1000
-        Fill.Size = UDim2.new(r,0,1,0)
-        Knob.Position = UDim2.new(r,-kSize/2,0.5,-kSize/2)
-        UpdLbl(S[key])
+    local function Apply(sx)
+        local w=TrHit.AbsoluteSize.X; if w==0 then return end
+        local r=math.clamp((sx-TrHit.AbsolutePosition.X)/w,0,1)
+        S[key]=math.floor((minV+(maxV-minV)*r)*1000+0.5)/1000
+        Fill.Size=UDim2.new(r,0,1,0); Knob.Position=UDim2.new(r,-kSz/2,0.5,-kSz/2); UpdLbl(S[key])
     end
-    TrHit.InputBegan:Connect(function(input)
-        if slideInput then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    TrHit.InputBegan:Connect(function(i)
+        local t=i.UserInputType
+        if t~=Enum.UserInputType.MouseButton1 and t~=Enum.UserInputType.Touch then return end
         if Locked() then return end
-        slideInput = input; applyPos(input.Position.X)
+        _slide=Apply; Apply(i.Position.X)
     end)
-    TrHit.InputChanged:Connect(function(input)
-        if input ~= slideInput then return end
-        if Locked() then slideInput = nil; return end
-        applyPos(input.Position.X)
-    end)
-    TrHit.InputEnded:Connect(function(input)
-        if input == slideInput then slideInput = nil end
+    Knob.InputBegan:Connect(function(i)
+        local t=i.UserInputType
+        if t~=Enum.UserInputType.MouseButton1 and t~=Enum.UserInputType.Touch then return end
+        if Locked() then return end
+        _slide=Apply
     end)
 end
 
-local function MakeInfo(p, color, order, h)
-    local l = Instance.new("TextLabel", p)
-    l.Size = UDim2.new(0.9,0,0,h or 15); l.BackgroundTransparency = 1
-    l.Font = Enum.Font.Gotham; l.TextSize = 11; l.TextColor3 = color or C.subtext
-    l.TextXAlignment = Enum.TextXAlignment.Left; l.LayoutOrder = order; l.ZIndex = 3
-    return l
-end
-
-local function MakeScroll()
-    local sf = Instance.new("ScrollingFrame", Main)
-    sf.Size = UDim2.new(1,0,1,-CONTENT_TOP); sf.Position = UDim2.new(0,0,0,CONTENT_TOP)
-    sf.BackgroundTransparency = 1; sf.BorderSizePixel = 0
-    sf.ScrollBarThickness = isMobile and 4 or 3; sf.ScrollBarImageColor3 = C.accent2
-    sf.CanvasSize = UDim2.new(0,0,0,0); sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    sf.ZIndex = 2; sf.Visible = false; sf.ElasticBehavior = Enum.ElasticBehavior.Always
-    sf.ScrollingEnabled = true
-    local l = Instance.new("UIListLayout", sf)
-    l.Padding = UDim.new(0, 5); l.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    l.SortOrder = Enum.SortOrder.LayoutOrder
-    local pad = Instance.new("UIPadding", sf)
-    pad.PaddingTop = UDim.new(0, 8); pad.PaddingBottom = UDim.new(0, 10)
+local function MakeScroll(parent)
+    local sf=Instance.new("ScrollingFrame",parent)
+    sf.Size=UDim2.new(1,0,1,-CTOP); sf.Position=UDim2.new(0,0,0,CTOP)
+    sf.BackgroundTransparency=1; sf.BorderSizePixel=0
+    sf.ScrollBarThickness=isMobile and 3 or 2; sf.ScrollBarImageColor3=C.accent2
+    sf.CanvasSize=UDim2.new(0,0,0,0); sf.AutomaticCanvasSize=Enum.AutomaticSize.Y
+    sf.ZIndex=2; sf.Visible=false; sf.ElasticBehavior=Enum.ElasticBehavior.Always
+    local ll=Instance.new("UIListLayout",sf)
+    ll.Padding=UDim.new(0,4); ll.HorizontalAlignment=Enum.HorizontalAlignment.Center
+    ll.SortOrder=Enum.SortOrder.LayoutOrder
+    local pad=Instance.new("UIPadding",sf)
+    pad.PaddingTop=UDim.new(0,7); pad.PaddingBottom=UDim.new(0,10)
     return sf
 end
 
-local TAB_NAMES   = { "Main","Detect","Visual","Triggerbot","FPS","Config" }
-local tabScrolls  = {}; local tabBtns = {}; local activeTab = nil
+-- ── Floating toggle button ────────────────────────────────────────
+local ToggleBtn=Instance.new("TextButton",ScreenGui)
+ToggleBtn.Name="Z0M_TB"; ToggleBtn.Size=UDim2.new(0,50,0,50)
+ToggleBtn.Position=isMobile and UDim2.new(1,-66,1,-144) or UDim2.new(1,-64,0,56)
+ToggleBtn.BackgroundColor3=Color3.fromRGB(10,11,20); ToggleBtn.BorderSizePixel=0
+ToggleBtn.Font=Enum.Font.GothamBold; ToggleBtn.TextSize=20; ToggleBtn.Text="⚡"
+ToggleBtn.TextColor3=C.accent; ToggleBtn.AutoButtonColor=false; ToggleBtn.ZIndex=50; ToggleBtn.Active=true
+Corner(25,ToggleBtn); Stroke(C.accent2,1.5,ToggleBtn)
 
-local function SwitchTab(name)
-    if activeTab == name then return end; activeTab = name
-    for n, sf in pairs(tabScrolls) do sf.Visible = (n == name) end
-    for n, btn in pairs(tabBtns) do
-        local on = (n == name)
-        TweenService:Create(btn, TweenInfo.new(0.12), {
-            BackgroundColor3 = on and C.tabSel or C.tabBtn,
-            TextColor3       = on and C.accent  or C.subtext,
-        }):Play()
-        local line = btn:FindFirstChild("_line")
-        if line then
-            TweenService:Create(line, TweenInfo.new(0.12), {
-                BackgroundColor3 = on and C.accent or C.tabBar
+do
+    local mr={v=false}
+    MakeDraggable(ToggleBtn,ToggleBtn,isMobile and 18 or 10,mr)
+    ToggleBtn.MouseButton1Click:Connect(function()
+        if mr.v then mr.v=false; return end
+        if _G.__Z0M_Main then
+            _G.__Z0M_Main.Visible = not _G.__Z0M_Main.Visible
+            TweenService:Create(ToggleBtn,TweenInfo.new(0.12),{
+                BackgroundColor3=_G.__Z0M_Main.Visible and Color3.fromRGB(18,20,42) or Color3.fromRGB(10,11,20)
             }):Play()
         end
+    end)
+end
+
+-- ── Mobile triggerbot button ──────────────────────────────────────
+local MobileTBBtn = nil
+if isMobile then
+    MobileTBBtn=Instance.new("TextButton",ScreenGui)
+    MobileTBBtn.Name="Z0M_MobileTB"; MobileTBBtn.Size=UDim2.new(0,156,0,54)
+    MobileTBBtn.Position=UDim2.new(0,12,1,-174); MobileTBBtn.BorderSizePixel=0
+    MobileTBBtn.Font=Enum.Font.GothamBold; MobileTBBtn.TextSize=11; MobileTBBtn.TextLineHeight=1.3
+    MobileTBBtn.AutoButtonColor=false; MobileTBBtn.ZIndex=50; MobileTBBtn.Active=true
+    Corner(26,MobileTBBtn)
+    local mbDot=Instance.new("Frame",MobileTBBtn); mbDot.Name="_dot"
+    mbDot.Size=UDim2.new(0,7,0,7); mbDot.Position=UDim2.new(0,12,0.5,-3.5)
+    mbDot.BorderSizePixel=0; mbDot.ZIndex=51; Corner(4,mbDot)
+    local mbStroke=Stroke(Color3.fromRGB(200,40,40),1.5,MobileTBBtn)
+
+    local function SyncMobileTB()
+        if tbActive then
+            MobileTBBtn.Text="TRIGGERBOT\nACTIVE ✓"
+            MobileTBBtn.TextColor3=Color3.fromRGB(80,230,110)
+            MobileTBBtn.BackgroundColor3=Color3.fromRGB(10,38,16)
+            mbStroke.Color=C.green; mbDot.BackgroundColor3=C.green
+        else
+            MobileTBBtn.Text="TRIGGERBOT\nTAP TOGGLE"
+            MobileTBBtn.TextColor3=Color3.fromRGB(255,80,80)
+            MobileTBBtn.BackgroundColor3=Color3.fromRGB(26,8,8)
+            mbStroke.Color=Color3.fromRGB(200,40,40); mbDot.BackgroundColor3=Color3.fromRGB(200,40,40)
+        end
+    end
+    SyncMobileTB()
+    _G.__Z0M_SyncTB = function()
+        SyncMobileTB()
+        if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
+        if _G.__Z0M_RefreshStatus   then _G.__Z0M_RefreshStatus()   end
+    end
+
+    local mr={v=false}
+    MakeDraggable(MobileTBBtn,MobileTBBtn,20,mr)
+    MobileTBBtn.MouseButton1Click:Connect(function()
+        if mr.v then mr.v=false; return end
+        if not S.TBEnabled then return end
+        if tbActive then DeactivateTB() else ActivateTB() end
+        SyncMobileTB()
+    end)
+else
+    _G.__Z0M_SyncTB = function()
+        if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
+        if _G.__Z0M_RefreshStatus   then _G.__Z0M_RefreshStatus()   end
     end
 end
 
-local TAB_W = math.floor(W / #TAB_NAMES)
-for idx, tname in ipairs(TAB_NAMES) do
-    local btn = Instance.new("TextButton", TabBar)
-    btn.Name = tname; btn.Size = UDim2.new(0,TAB_W,1,0)
-    btn.BackgroundColor3 = C.tabBtn; btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold; btn.TextSize = isMobile and 10 or 11
-    btn.TextColor3 = C.subtext; btn.Text = tname; btn.AutoButtonColor = false
-    btn.ZIndex = 4; btn.LayoutOrder = idx
-    local line = Instance.new("Frame", btn); line.Name = "_line"
-    line.Size = UDim2.new(0.7,0,0,2); line.Position = UDim2.new(0.15,0,1,-2)
-    line.BackgroundColor3 = C.tabBar; line.BorderSizePixel = 0; line.ZIndex = 5
-    Instance.new("UICorner", line).CornerRadius = UDim.new(1, 0)
-    tabBtns[tname] = btn; tabScrolls[tname] = MakeScroll()
-    btn.MouseButton1Click:Connect(function() SwitchTab(tname) end)
+-- ── Main panel ───────────────────────────────────────────────────
+local Main=Instance.new("Frame",ScreenGui)
+Main.Name="MainPanel"; Main.Size=UDim2.new(0,W,0,HFUL)
+Main.Position=isMobile and UDim2.new(0.5,-W/2,0.5,-HFUL/2) or UDim2.new(0,18,0.5,-HFUL/2)
+Main.BackgroundColor3=C.bg; Main.BorderSizePixel=0; Main.Active=true
+Main.ClipsDescendants=true; Main.Visible=false; Main.ZIndex=10
+Corner(10,Main); Stroke(C.accent2,1,Main)
+_G.__Z0M_Main=Main
+
+-- Accent bar
+local AccBar=Instance.new("Frame",Main); AccBar.Size=UDim2.new(0,3,1,0); AccBar.BorderSizePixel=0; AccBar.ZIndex=4
+Grad(ColorSequence.new({
+    ColorSequenceKeypoint.new(0,Color3.fromRGB(110,65,230)),
+    ColorSequenceKeypoint.new(0.4,Color3.fromRGB(80,190,255)),
+    ColorSequenceKeypoint.new(0.7,Color3.fromRGB(30,210,175)),
+    ColorSequenceKeypoint.new(1,Color3.fromRGB(255,60,60)),
+}),90,AccBar)
+
+-- Header (Active=true is required for drag to register)
+local Header=Instance.new("Frame",Main)
+Header.Name="Header"; Header.Size=UDim2.new(1,0,0,HDR)
+Header.BackgroundColor3=C.header; Header.BorderSizePixel=0; Header.ZIndex=3; Header.Active=true
+
+local TitleLbl=Instance.new("TextLabel",Header)
+TitleLbl.Size=UDim2.new(1,-80,1,0); TitleLbl.Position=UDim2.new(0,14,0,0)
+TitleLbl.BackgroundTransparency=1; TitleLbl.Text="⚡  z0mware  v3.0"
+TitleLbl.Font=Enum.Font.GothamBold; TitleLbl.TextSize=isMobile and 14 or 13
+TitleLbl.TextColor3=C.accent; TitleLbl.TextXAlignment=Enum.TextXAlignment.Left; TitleLbl.ZIndex=4
+
+local function HdrBtn(x, bg, txt)
+    local b=Instance.new("TextButton",Header)
+    b.Size=UDim2.new(0,26,0,22); b.Position=UDim2.new(1,x,0.5,-11)
+    b.BackgroundColor3=bg; b.BorderSizePixel=0; b.Font=Enum.Font.GothamBold
+    b.TextSize=12; b.TextColor3=Color3.new(1,1,1); b.Text=txt
+    b.AutoButtonColor=false; b.ZIndex=5; Corner(5,b); return b
+end
+local MinBtn   = HdrBtn(-62, C.panel,                  "─")
+MinBtn.TextColor3 = C.sub
+local CloseBtn = HdrBtn(-30, Color3.fromRGB(160,28,28), "✕")
+
+MakeDraggable(Main, Header)
+
+-- Tab bar
+local TabBar=Instance.new("Frame",Main)
+TabBar.Name="TabBar"; TabBar.Size=UDim2.new(1,0,0,TABH); TabBar.Position=UDim2.new(0,0,0,HDR)
+TabBar.BackgroundColor3=C.tabBar; TabBar.BorderSizePixel=0; TabBar.ZIndex=3
+local TBL=Instance.new("UIListLayout",TabBar)
+TBL.FillDirection=Enum.FillDirection.Horizontal; TBL.SortOrder=Enum.SortOrder.LayoutOrder
+
+local TAB_NAMES={"Main","Detect","Visual","Triggerbot","FPS","Config"}
+local tabScrolls={}; local tabBtns={}; local activeTab=nil
+
+local function SwitchTab(name)
+    if activeTab==name then return end; activeTab=name
+    for n,sf in pairs(tabScrolls) do sf.Visible=(n==name) end
+    for n,btn in pairs(tabBtns) do
+        local on=(n==name)
+        TweenService:Create(btn,TweenInfo.new(0.12),{
+            BackgroundColor3=on and C.tabSel or C.tabBtn,
+            TextColor3=on and C.accent or C.sub,
+        }):Play()
+        local ln=btn:FindFirstChild("_ln")
+        if ln then TweenService:Create(ln,TweenInfo.new(0.12),{BackgroundColor3=on and C.accent or C.tabBar}):Play() end
+    end
 end
 
--- ═══════════════════════════════ MAIN TAB ══
+local TW=math.floor(W/#TAB_NAMES)
+for idx,tn in ipairs(TAB_NAMES) do
+    local btn=Instance.new("TextButton",TabBar)
+    btn.Name=tn; btn.Size=UDim2.new(0,TW,1,0)
+    btn.BackgroundColor3=C.tabBtn; btn.BorderSizePixel=0
+    btn.Font=Enum.Font.GothamBold; btn.TextSize=isMobile and 9 or 10
+    btn.TextColor3=C.sub; btn.Text=tn; btn.AutoButtonColor=false; btn.ZIndex=4; btn.LayoutOrder=idx
+    local ln=Instance.new("Frame",btn); ln.Name="_ln"
+    ln.Size=UDim2.new(0.7,0,0,2); ln.Position=UDim2.new(0.15,0,1,-2)
+    ln.BackgroundColor3=C.tabBar; ln.BorderSizePixel=0; ln.ZIndex=5; Corner(1,ln)
+    tabBtns[tn]=btn; tabScrolls[tn]=MakeScroll(Main)
+    btn.MouseButton1Click:Connect(function() SwitchTab(tn) end)
+end
+
+-- ═════════════════════════════ TAB: MAIN ══
 do
-    local sc = tabScrolls["Main"]; local o = 0; local function O() o = o+1; return o end
+    local sc=tabScrolls["Main"]; local o=0; local function O() o=o+1; return o end
 
-    local StatusCard = Instance.new("Frame", sc)
-    StatusCard.Size = UDim2.new(0.9,0,0,isMobile and 76 or 62)
-    StatusCard.BackgroundColor3 = C.panel; StatusCard.BorderSizePixel = 0; StatusCard.LayoutOrder = O()
-    Instance.new("UICorner", StatusCard).CornerRadius = UDim.new(0, 10)
-    local _scStroke = Instance.new("UIStroke", StatusCard); _scStroke.Thickness = 1; _scStroke.Transparency = 0.5
+    -- Status card
+    local Card=Instance.new("Frame",sc)
+    Card.Size=UDim2.new(0.92,0,0,isMobile and 72 or 60)
+    Card.BackgroundColor3=C.panel; Card.BorderSizePixel=0; Card.LayoutOrder=O(); Corner(10,Card)
+    local CardStroke=Stroke(C.green,1,Card); CardStroke.Transparency=0.4
+    local SLine=Instance.new("TextLabel",Card)
+    SLine.Size=UDim2.new(1,0,0.55,0); SLine.Position=UDim2.new(0,0,0.08,0)
+    SLine.BackgroundTransparency=1; SLine.Font=Enum.Font.GothamBold
+    SLine.TextSize=isMobile and 14 or 12; SLine.TextXAlignment=Enum.TextXAlignment.Center; SLine.ZIndex=3
+    local SubLine=Instance.new("TextLabel",Card)
+    SubLine.Size=UDim2.new(1,0,0.38,0); SubLine.Position=UDim2.new(0,0,0.62,0)
+    SubLine.BackgroundTransparency=1; SubLine.Font=Enum.Font.Gotham; SubLine.TextSize=10
+    SubLine.TextXAlignment=Enum.TextXAlignment.Center; SubLine.TextColor3=C.sub; SubLine.ZIndex=3
 
-    local StatusLbl = Instance.new("TextLabel", StatusCard)
-    StatusLbl.Size = UDim2.new(1,0,0.55,0); StatusLbl.Position = UDim2.new(0,0,0.1,0)
-    StatusLbl.BackgroundTransparency = 1; StatusLbl.Font = Enum.Font.GothamBold
-    StatusLbl.TextSize = isMobile and 15 or 13
-    StatusLbl.TextXAlignment = Enum.TextXAlignment.Center; StatusLbl.ZIndex = 3
-
-    local SubStatusLbl = Instance.new("TextLabel", StatusCard)
-    SubStatusLbl.Size = UDim2.new(1,0,0.35,0); SubStatusLbl.Position = UDim2.new(0,0,0.62,0)
-    SubStatusLbl.BackgroundTransparency = 1; SubStatusLbl.Font = Enum.Font.Gotham
-    SubStatusLbl.TextSize = 10; SubStatusLbl.TextXAlignment = Enum.TextXAlignment.Center
-    SubStatusLbl.TextColor3 = C.subtext; SubStatusLbl.ZIndex = 3
+    local STATE_NAMES = {"IDLE","ARMED","FIRED"}
+    local STATE_COLS  = {C.sub, C.yellow, C.green}
 
     local function RefreshStatus()
-        StatusLbl.Text = S.AutoParry and "⬤  AUTO PARRY  ON" or "○  AUTO PARRY  OFF"
-        StatusLbl.TextColor3 = S.AutoParry and C.green or C.red
-        _scStroke.Color = S.AutoParry and C.green or C.red
-        if hasParried then
-            SubStatusLbl.Text = "Parried — waiting for next round"
-        elseif inWindow then
-            SubStatusLbl.Text = string.format("Firing... %d/%d", fireCount, S.MaxFires)
-        else
-            SubStatusLbl.Text = string.format("Armed — threshold %.0fms", GetThreshold() * 1000)
+        local on = S.AutoParry and not tbActive
+        SLine.Text      = on and "⬤  AUTO PARRY  ON" or (tbActive and "⬤  TRIGGERBOT  FIRING" or "○  AUTO PARRY  OFF")
+        SLine.TextColor3= on and C.green or (tbActive and C.red or C.red)
+        CardStroke.Color= on and C.green or (tbActive and C.red or C.red)
+        -- Subline: current parry state + threshold
+        local thr = GetThreshold()
+        local ball = currentBall
+        local spd2 = ball and ball.Parent and ball:FindFirstChild("zoomies")
+                     and ball:FindFirstChild("zoomies").VectorVelocity.Magnitude or 0
+        if S.AutoTiming and spd2 > 0.5 then
+            thr = math.max(thr, math.min(S.MinFireDist/spd2, 2.0))
         end
+        local st = STATE_NAMES[parryState+1] or "?"
+        SubLine.Text = string.format("State: %s  |  threshold: %.0fms", st, thr*1000)
+        SubLine.TextColor3 = STATE_COLS[parryState+1] or C.sub
     end
-    RefreshStatus(); _G.__Z0M_RefreshStatus = RefreshStatus
+    RefreshStatus(); _G.__Z0M_RefreshStatus=RefreshStatus
 
-    MakeDivider(sc, O()); MakeSection(sc, "  ⚔  Combat", O())
-    MakeToggle(sc, "Auto Parry",
+    Div(sc,O()); Section(sc,"  ⚔  Combat",O())
+    MakeToggle(sc,"Auto Parry",
         function() return S.AutoParry end,
-        function(v) S.AutoParry = v end,
-        C.green, O(), function() RefreshStatus() end)
-    MakeToggle(sc, "Auto Timing",
+        function(v) S.AutoParry=v end,
+        C.green,O(),function() RefreshStatus() end)
+    MakeToggle(sc,"Auto Timing",
         function() return S.AutoTiming end,
         function(v)
-            S.AutoTiming = v
-            -- FIX: show actual threshold value (not S.TriggerTime) when auto is on
-            if sliderRefs["TriggerTime"] then
-                sliderRefs["TriggerTime"](v and GetThreshold() or S.TriggerTime)
-            end
+            S.AutoTiming=v
+            if sliderRefs["TriggerTime"] then sliderRefs["TriggerTime"](v and GetThreshold() or S.TriggerTime) end
+            if sliderRefs["MinFireDist"] then sliderRefs["MinFireDist"](S.MinFireDist) end
         end,
-        C.blue, O())
-    MakeToggle(sc, "Clash Mode",
+        C.blue,O())
+    MakeToggle(sc,"Clash Mode",
         function() return S.ClashMode end,
-        function(v) S.ClashMode = v end,
-        C.orange, O())
+        function(v) S.ClashMode=v end,
+        C.orange,O())
 
-    MakeDivider(sc, O()); MakeSection(sc, "  🎛  Tuning", O())
-    MakeSlider(sc, "Trigger (s)", "TriggerTime", 0.10, 0.55, "%.3f", "AutoTiming", O())
-    MakeSlider(sc, "Clash dist",  "ClashDist",   4,   20,   "%.0f st", nil,          O())
-    MakeSlider(sc, "Max fires",   "MaxFires",    1,   8,    "%.0f",    nil,          O())
+    Div(sc,O()); Section(sc,"  🎛  Tuning",O())
+    MakeSlider(sc,"Trigger (s)","TriggerTime",0.10,0.55,"%.3f","AutoTiming",O())
+    MakeSlider(sc,"Min fire dist","MinFireDist",3,18,"%.0f st",nil,O())
+    local n1=InfoLbl(sc,C.sub,O(),13); n1.Text="  Dist floor: auto parry fires at ≥ this many studs (AutoTiming only)"
+    MakeSlider(sc,"Clash dist","ClashDist",4,20,"%.0f st",nil,O())
 
-    MakeDivider(sc, O()); MakeSection(sc, "  📊  Live", O())
-    local PingLbl   = MakeInfo(sc, nil,                         O(), 16)
-    local FpsLbl    = MakeInfo(sc, C.cyan,                      O(), 14)
-    local CompLbl   = MakeInfo(sc, C.orange,                    O(), 14)
-    local BallLbl   = MakeInfo(sc, C.blue,                      O(), 14)
-    local TgtLbl    = MakeInfo(sc, Color3.fromRGB(190,140,255), O(), 14)
-    local FireLbl   = MakeInfo(sc, Color3.fromRGB(255,200,60),  O(), 14)
-    local ThreshLbl = MakeInfo(sc, C.subtext,                   O(), 14)
+    Div(sc,O()); Section(sc,"  📊  Live",O())
+    local PingLbl  = InfoLbl(sc,C.cyan,   O(),15)
+    local FpsLbl   = InfoLbl(sc,C.lime,   O(),14)
+    local BallLbl  = InfoLbl(sc,C.blue,   O(),14)
+    local TgtLbl   = InfoLbl(sc,C.purple, O(),14)
+    local SpdLbl   = InfoLbl(sc,C.sub,    O(),14)
+    local TtiLbl   = InfoLbl(sc,C.yellow, O(),14)
+    local CompLbl  = InfoLbl(sc,C.orange, O(),14)
 
     _G.__Z0M_UpdateMain = function()
-        local thresh = GetThreshold()
         RefreshStatus()
-
-        local spiking = peakPing > smoothPing * 1.5 and peakPing > smoothPing + 30
-        local pc = displayPing < 60 and C.green
-            or displayPing < 120 and Color3.fromRGB(255,210,40) or C.red
+        local spiking = peakPing > smoothPing*1.4 and peakPing > smoothPing+25
+        local pc = displayPing<60 and C.green or displayPing<120 and C.yellow or C.red
         PingLbl.TextColor3 = spiking and C.red or pc
         PingLbl.Text = spiking
-            and string.format("Ping: %.0f ms  ▲ spike %.0f", displayPing, peakPing)
-            or  string.format("Ping: %.0f ms", displayPing)
+            and string.format("Ping: %.0fms  ▲ spike %.0f", displayPing, peakPing)
+            or  string.format("Ping: %.0fms", displayPing)
 
-        local fc = smoothFPS >= 55 and C.green or smoothFPS >= 35 and Color3.fromRGB(255,210,40) or C.red
-        FpsLbl.TextColor3 = fc
-        FpsLbl.Text = string.format("FPS: %.0f  (raw %.0f)", smoothFPS, rawFPS)
+        local fc = smoothFPS>=55 and C.lime or smoothFPS>=35 and C.yellow or C.red
+        FpsLbl.TextColor3=fc
+        FpsLbl.Text=string.format("FPS: %.0f  (raw %.0f)", smoothFPS, rawFPS)
 
-        local fpsC2 = fpsLow and math.clamp((60-smoothFPS)/60*0.07, 0, 0.07) or 0
-        local jitC2 = math.clamp(math.sqrt(dtVar) * 3, 0, 0.04)
-        local anyC = fpsC2 > 0.001 or jitC2 > 0.001 or spiking
+        local jitC2 = math.clamp(math.sqrt(dtVar)*3,0,0.04)
+        local fpsC2 = fpsLow and math.clamp((60-smoothFPS)/60*0.07,0,0.07) or 0
+        local anyC  = fpsC2>0.001 or jitC2>0.001 or spiking
         CompLbl.Text = anyC
-            and string.format("⚠ Comp: +%.0fms ping  +%.0fms fps  +%.0fms jitter",
+            and string.format("⚠ +%.0fms ping +%.0fms fps +%.0fms jitter",
                 smoothPing/2, fpsC2*1000, jitC2*1000)
-            or "  All systems nominal"
-        CompLbl.TextColor3 = anyC and C.orange or C.subtext
-
-        ThreshLbl.Text = S.AutoTiming
-            and string.format("Threshold: %.3f s  (auto)", thresh)
-            or  string.format("Threshold: %.3f s  (manual)", S.TriggerTime)
-        if S.AutoTiming and sliderRefs["TriggerTime"] then
-            sliderRefs["TriggerTime"](thresh)
-        end
+            or "  Systems nominal"
+        CompLbl.TextColor3 = anyC and C.orange or C.sub
 
         local ball = currentBall
         if ball and ball.Parent then
-            BallLbl.TextColor3 = C.green; BallLbl.Text = "✓  Ball: " .. ball.Name
+            BallLbl.TextColor3=C.green; BallLbl.Text="✓ Ball: "..ball.Name
             local tgt = ball:GetAttribute("target") or "—"
-            local isUs = tgt == LP.Name
-            TgtLbl.TextColor3 = isUs and C.red or C.subtext
-            TgtLbl.Text = "Target: " .. tgt .. (isUs and "  ← YOU" or "")
-            if hasParried then
-                FireLbl.Text = "✓ Parried — armed when ball returns"; FireLbl.TextColor3 = C.green
+            TgtLbl.TextColor3 = tgt==LP.Name and C.red or C.sub
+            TgtLbl.Text = "Target: "..tgt..(tgt==LP.Name and "  ← YOU" or "")
+            local z = ball:FindFirstChild("zoomies")
+            local spd3 = z and z.VectorVelocity.Magnitude or 0
+            local dist3 = cachedHRP and (cachedHRP.Position-ball.Position).Magnitude or 0
+            SpdLbl.Text = string.format("Speed: %.0f u/s  dist: %.1f st", spd3, dist3)
+            SpdLbl.TextColor3 = spd3>80 and C.red or spd3>40 and C.yellow or C.sub
+            if cachedHRP and spd3>0.5 then
+                local tti3 = GetTTI(ball,cachedHRP,1/60)
+                local thr3 = GetThreshold()
+                if S.AutoTiming then thr3=math.max(thr3,math.min(S.MinFireDist/spd3,2.0)) end
+                TtiLbl.Text = tti3>=10 and "TTI: —"
+                    or string.format("TTI: %.3fs  (thr %.3fs)", tti3, thr3)
+                TtiLbl.TextColor3 = tti3<=thr3 and C.green or C.yellow
             else
-                FireLbl.Text = string.format("Fires: %d/%d  %s", fireCount, S.MaxFires,
-                    inWindow and "[ WINDOW ]" or "")
-                FireLbl.TextColor3 = inWindow and Color3.fromRGB(255,200,60) or C.subtext
+                TtiLbl.Text="TTI: —"; TtiLbl.TextColor3=C.sub
+            end
+            if S.AutoTiming and sliderRefs["TriggerTime"] then
+                local thr4=GetThreshold()
+                local spd4=(z and z.VectorVelocity.Magnitude or 0)
+                if S.AutoTiming and spd4>0.5 then thr4=math.max(thr4,math.min(S.MinFireDist/spd4,2.0)) end
+                sliderRefs["TriggerTime"](thr4)
             end
         else
-            BallLbl.TextColor3 = C.red; BallLbl.Text = "✗  No ball"
-            TgtLbl.Text = "Target: —"; FireLbl.Text = "Fires: —"
+            BallLbl.TextColor3=C.red; BallLbl.Text="✗ No ball"
+            TgtLbl.Text="Target: —"; SpdLbl.Text="Speed: —"; TtiLbl.Text="TTI: —"
         end
     end
 
-    MakeDivider(sc, O()); MakeSection(sc, "  ⚠  Quick", O())
-    local UBtn = Instance.new("TextButton", sc)
-    UBtn.Size = UDim2.new(0.9,0,0,34); UBtn.BackgroundColor3 = Color3.fromRGB(110,20,20)
-    UBtn.BorderSizePixel = 0; UBtn.LayoutOrder = O(); UBtn.Font = Enum.Font.GothamBold
-    UBtn.TextSize = 11; UBtn.TextColor3 = Color3.fromRGB(255,185,185)
-    UBtn.Text = "🗑  UNLOAD z0mware"; UBtn.AutoButtonColor = false
-    Instance.new("UICorner", UBtn).CornerRadius = UDim.new(0, 8)
-    local uConf = false
+    Div(sc,O()); Section(sc,"  ⚠  Quick",O())
+    local UBtn=Instance.new("TextButton",sc)
+    UBtn.Size=UDim2.new(0.92,0,0,32); UBtn.BackgroundColor3=Color3.fromRGB(110,20,20)
+    UBtn.BorderSizePixel=0; UBtn.LayoutOrder=O(); UBtn.Font=Enum.Font.GothamBold
+    UBtn.TextSize=11; UBtn.TextColor3=Color3.fromRGB(255,185,185)
+    UBtn.Text="🗑  UNLOAD z0mware"; UBtn.AutoButtonColor=false; Corner(7,UBtn)
+    local uConf=false
     UBtn.MouseButton1Click:Connect(function()
         if not uConf then
-            uConf = true; UBtn.Text = "⚠  CLICK AGAIN TO CONFIRM"
-            UBtn.BackgroundColor3 = Color3.fromRGB(180,50,15)
-            task.delay(3, function()
-                if uConf then uConf = false; UBtn.Text = "🗑  UNLOAD z0mware"
-                    UBtn.BackgroundColor3 = Color3.fromRGB(110,20,20) end
+            uConf=true; UBtn.Text="⚠  CLICK AGAIN TO CONFIRM"; UBtn.BackgroundColor3=Color3.fromRGB(180,50,15)
+            task.delay(3,function()
+                if uConf then uConf=false; UBtn.Text="🗑  UNLOAD z0mware"; UBtn.BackgroundColor3=Color3.fromRGB(110,20,20) end
             end)
         else
-            uConf = false
-            if tbActive then DeactivateTriggerbot() end
+            uConf=false
+            if tbActive then DeactivateTB() end
             RestoreAll(); ClearAllESP(); DisconnectBall()
-            for _, c in ipairs(_conns) do pcall(function() c:Disconnect() end) end
-            if _G.__Z0M_CPSOverlay and _G.__Z0M_CPSOverlay.Parent then
-                _G.__Z0M_CPSOverlay:Destroy()
-            end
-            TweenService:Create(Main, TweenInfo.new(0.2,Enum.EasingStyle.Back,Enum.EasingDirection.In),
-                {Size=UDim2.new(0,0,0,0)}):Play()
-            TweenService:Create(ToggleBtn, TweenInfo.new(0.15), {Size=UDim2.new(0,0,0,0)}):Play()
-            if MobileTBBtn then
-                TweenService:Create(MobileTBBtn, TweenInfo.new(0.15), {Size=UDim2.new(0,0,0,0)}):Play()
-            end
-            task.delay(0.3, function() ScreenGui:Destroy() end)
+            for _,c in ipairs(_conns) do pcall(function() c:Disconnect() end) end
+            if _G.__Z0M_CPSOv and _G.__Z0M_CPSOv.Parent then _G.__Z0M_CPSOv:Destroy() end
+            TweenService:Create(Main,TweenInfo.new(0.2,Enum.EasingStyle.Back,Enum.EasingDirection.In),{Size=UDim2.new(0,0,0,0)}):Play()
+            TweenService:Create(ToggleBtn,TweenInfo.new(0.15),{Size=UDim2.new(0,0,0,0)}):Play()
+            if MobileTBBtn then TweenService:Create(MobileTBBtn,TweenInfo.new(0.15),{Size=UDim2.new(0,0,0,0)}):Play() end
+            task.delay(0.3,function() ScreenGui:Destroy() end)
         end
     end)
 end
 
--- ════════════════════════════ DETECT TAB ══
+-- ═════════════════════════════ TAB: DETECT ══
 do
-    local sc = tabScrolls["Detect"]; local o = 0; local function O() o = o+1; return o end
+    local sc=tabScrolls["Detect"]; local o=0; local function O() o=o+1; return o end
 
-    MakeSection(sc, "  ⚡  Aerodynamic Slash", O()); MakeDivider(sc, O())
+    Section(sc,"  ⚡  Aerodynamic Slash",O()); Div(sc,O())
 
-    local AeroCard = Instance.new("Frame", sc)
-    AeroCard.Size = UDim2.new(0.9,0,0,isMobile and 68 or 56)
-    AeroCard.BackgroundColor3 = C.panel; AeroCard.BorderSizePixel = 0; AeroCard.LayoutOrder = O()
-    Instance.new("UICorner", AeroCard).CornerRadius = UDim.new(0, 8)
-    local _aStroke = Instance.new("UIStroke", AeroCard); _aStroke.Thickness = 1; _aStroke.Transparency = 0.5
-    local AeroLbl = Instance.new("TextLabel", AeroCard)
-    AeroLbl.Size = UDim2.new(1,0,0.55,0); AeroLbl.Position = UDim2.new(0,0,0.1,0)
-    AeroLbl.BackgroundTransparency = 1; AeroLbl.Font = Enum.Font.GothamBold
-    AeroLbl.TextSize = isMobile and 14 or 12; AeroLbl.TextXAlignment = Enum.TextXAlignment.Center; AeroLbl.ZIndex = 3
-    local AeroSubLbl = Instance.new("TextLabel", AeroCard)
-    AeroSubLbl.Size = UDim2.new(1,0,0.38,0); AeroSubLbl.Position = UDim2.new(0,0,0.6,0)
-    AeroSubLbl.BackgroundTransparency = 1; AeroSubLbl.Font = Enum.Font.Gotham
-    AeroSubLbl.TextSize = 10; AeroSubLbl.TextXAlignment = Enum.TextXAlignment.Center
-    AeroSubLbl.TextColor3 = C.subtext; AeroSubLbl.ZIndex = 3
+    local ACard=Instance.new("Frame",sc)
+    ACard.Size=UDim2.new(0.92,0,0,isMobile and 64 or 54)
+    ACard.BackgroundColor3=C.panel; ACard.BorderSizePixel=0; ACard.LayoutOrder=O(); Corner(8,ACard)
+    local AStroke=Stroke(C.cyan,1,ACard); AStroke.Transparency=0.4
+    local ALbl=Instance.new("TextLabel",ACard)
+    ALbl.Size=UDim2.new(1,0,0.55,0); ALbl.Position=UDim2.new(0,0,0.08,0)
+    ALbl.BackgroundTransparency=1; ALbl.Font=Enum.Font.GothamBold
+    ALbl.TextSize=isMobile and 13 or 11; ALbl.TextXAlignment=Enum.TextXAlignment.Center; ALbl.ZIndex=3
+    local ASubLbl=Instance.new("TextLabel",ACard)
+    ASubLbl.Size=UDim2.new(1,0,0.38,0); ASubLbl.Position=UDim2.new(0,0,0.60,0)
+    ASubLbl.BackgroundTransparency=1; ASubLbl.Font=Enum.Font.Gotham; ASubLbl.TextSize=10
+    ASubLbl.TextXAlignment=Enum.TextXAlignment.Center; ASubLbl.TextColor3=C.sub; ASubLbl.ZIndex=3
 
-    local function RefreshAeroCard()
+    local function RefAero()
         if not S.AeroDetect then
-            AeroLbl.Text = "○  AERO SLASH  DISABLED"; AeroLbl.TextColor3 = C.subtext
-            _aStroke.Color = C.subtext; AeroSubLbl.Text = "Enable below to detect speed spikes"
+            ALbl.Text="○  AERO  DISABLED"; ALbl.TextColor3=C.sub; AStroke.Color=C.sub
+            ASubLbl.Text="Enable to detect Aerodynamic Slash"
         elseif aeroDetected then
-            AeroLbl.Text = "⚡  AERO SLASH  DETECTED"; AeroLbl.TextColor3 = C.orange
-            _aStroke.Color = C.orange
-            AeroSubLbl.Text = string.format("Threshold boosted +%.0fms  |  expires %.1fs",
-                S.AeroThreshBoost, math.max(0, aeroExpiry - tick()))
+            ALbl.Text="⚡  AERO  DETECTED"; ALbl.TextColor3=C.orange; AStroke.Color=C.orange
+            ASubLbl.Text=string.format("+%.0fms threshold  |  %.1fs left",S.AeroBoost,math.max(0,aeroExpiry-tick()))
         else
-            AeroLbl.Text = "○  AERO SLASH  WATCHING"; AeroLbl.TextColor3 = C.cyan
-            _aStroke.Color = C.cyan
-            AeroSubLbl.Text = string.format("Baseline: %.0f u/s  |  Peak: %.0f u/s",
-                aeroBaselineSpd, aeroPeakSpd)
+            ALbl.Text="○  AERO  WATCHING"; ALbl.TextColor3=C.cyan; AStroke.Color=C.cyan
+            ASubLbl.Text=string.format("Base: %.0f u/s  Peak: %.0f u/s",aeroBase,aeroPeak)
         end
     end
-    RefreshAeroCard()
+    RefAero()
 
-    MakeToggle(sc, "Detect Aero Slash",
+    MakeToggle(sc,"Detect Aero Slash",
         function() return S.AeroDetect end,
-        function(v) S.AeroDetect = v; if not v then ResetAeroRound() end; RefreshAeroCard() end,
-        C.orange, O())
-    local an1 = MakeInfo(sc, C.subtext, O(), 26)
-    an1.Text = "  Detects when enemy uses Aerodynamic Slash.\n  Raises threshold so you parry the faster ball."
-    MakeSlider(sc, "Boost (ms)",  "AeroThreshBoost", 10, 200, "%.0f ms", nil, O())
-    MakeSlider(sc, "Expire (s)",  "AeroDecay",       0.3, 3.0, "%.1f s",  nil, O())
-    local an2 = MakeInfo(sc, C.subtext, O(), 26)
-    an2.Text = "  Boost: extra threshold added on detection.\n  Expire: seconds before detection resets."
+        function(v) S.AeroDetect=v; if not v then ResetAero() end; RefAero() end,
+        C.orange,O())
+    MakeSlider(sc,"Boost (ms)","AeroBoost",10,200,"%.0f ms",nil,O())
+    MakeSlider(sc,"Expire (s)","AeroDecay",0.3,3.0,"%.1f s",nil,O())
+    InfoLbl(sc,C.sub,O(),26).Text="  Boost: extra threshold added on detection.\n  Expire: seconds before detection resets."
 
-    MakeDivider(sc, O()); MakeSection(sc, "  📡  Curve Detection", O())
-    MakeToggle(sc, "Curve Detection",
-        function() return S.CurveDetection end,
-        function(v) S.CurveDetection = v; CurveClear() end,
-        C.purple, O())
-    local cdNote = MakeInfo(sc, C.subtext, O(), 13)
-    cdNote.Text = "  Required by Auto Curve. Provides trajectory sampling."
+    Div(sc,O()); Section(sc,"  📡  Curve Detection",O())
+    MakeToggle(sc,"Curve Detection",
+        function() return S.CurveDetect end,
+        function(v) S.CurveDetect=v; CurveClear() end,
+        C.purple,O())
+    InfoLbl(sc,C.sub,O(),13).Text="  Needed for Auto Curve & curved TTI prediction."
 
-    MakeDivider(sc, O()); MakeSection(sc, "  🔵  Auto Curve", O())
-    MakeToggle(sc, "Auto Curve",
+    Div(sc,O()); Section(sc,"  🔵  Auto Curve",O())
+    MakeToggle(sc,"Auto Curve",
         function() return S.AutoCurve end,
-        function(v) S.AutoCurve = v; if not v then acPinTarget = nil end end,
-        C.teal, O())
-    local acN1 = MakeInfo(sc, C.subtext, O(), 13); acN1.Text = "  After parrying, snaps camera to nearest enemy"
-    local acN2 = MakeInfo(sc, C.subtext, O(), 13); acN2.Text = "  so the ball curves toward them on exit."
-    MakeSlider(sc, "Snap dur (s)", "ACSnapDur", 0.05, 0.50, "%.2f", nil, O())
+        function(v) S.AutoCurve=v; if not v then acPinTarget=nil end end,
+        C.teal,O())
+    InfoLbl(sc,C.sub,O(),13).Text="  Snaps camera toward nearest enemy after parry."
+    MakeSlider(sc,"Snap dur (s)","ACSnapDur",0.05,0.50,"%.2f",nil,O())
 
-    MakeDivider(sc, O()); MakeSection(sc, "  📌  Curve Target", O())
-    local pinRow = Instance.new("Frame", sc)
-    pinRow.Size = UDim2.new(0.9,0,0,38); pinRow.BackgroundColor3 = C.panel
-    pinRow.BorderSizePixel = 0; pinRow.LayoutOrder = O()
-    Instance.new("UICorner", pinRow).CornerRadius = UDim.new(0, 8)
-    local pinLbl = Instance.new("TextLabel", pinRow)
-    pinLbl.Size = UDim2.new(1,-90,1,0); pinLbl.Position = UDim2.new(0,12,0,0)
-    pinLbl.BackgroundTransparency = 1; pinLbl.Font = Enum.Font.Gotham; pinLbl.TextSize = 11
-    pinLbl.TextColor3 = C.text; pinLbl.TextXAlignment = Enum.TextXAlignment.Left; pinLbl.ZIndex = 3
-    local pinBtn = Instance.new("TextButton", pinRow)
-    pinBtn.Size = UDim2.new(0,80,0,26); pinBtn.Position = UDim2.new(1,-88,0.5,-13)
-    pinBtn.BackgroundColor3 = C.teal; pinBtn.BorderSizePixel = 0; pinBtn.Font = Enum.Font.GothamBold
-    pinBtn.TextSize = 10; pinBtn.TextColor3 = Color3.fromRGB(0,0,0); pinBtn.Text = "Cycle"
-    pinBtn.AutoButtonColor = false; pinBtn.ZIndex = 5
-    Instance.new("UICorner", pinBtn).CornerRadius = UDim.new(0, 6)
-
-    local function RefreshPinLbl()
-        if acPinTarget then
-            pinLbl.Text = "  📌 " .. acPinTarget.DisplayName; pinLbl.TextColor3 = C.teal
-        else
-            pinLbl.Text = "  Auto (nearest)"; pinLbl.TextColor3 = C.subtext
-        end
+    Div(sc,O()); Section(sc,"  📌  Curve Target",O())
+    local pinRow=Instance.new("Frame",sc)
+    pinRow.Size=UDim2.new(0.92,0,0,36); pinRow.BackgroundColor3=C.panel
+    pinRow.BorderSizePixel=0; pinRow.LayoutOrder=O(); Corner(7,pinRow)
+    local pinLbl=Instance.new("TextLabel",pinRow)
+    pinLbl.Size=UDim2.new(1,-90,1,0); pinLbl.Position=UDim2.new(0,12,0,0)
+    pinLbl.BackgroundTransparency=1; pinLbl.Font=Enum.Font.Gotham; pinLbl.TextSize=11
+    pinLbl.TextColor3=C.text; pinLbl.TextXAlignment=Enum.TextXAlignment.Left; pinLbl.ZIndex=3
+    local pinBtn=Instance.new("TextButton",pinRow)
+    pinBtn.Size=UDim2.new(0,78,0,24); pinBtn.Position=UDim2.new(1,-86,0.5,-12)
+    pinBtn.BackgroundColor3=C.teal; pinBtn.BorderSizePixel=0; pinBtn.Font=Enum.Font.GothamBold
+    pinBtn.TextSize=10; pinBtn.TextColor3=Color3.fromRGB(0,0,0); pinBtn.Text="Cycle"
+    pinBtn.AutoButtonColor=false; pinBtn.ZIndex=5; Corner(5,pinBtn)
+    local function RefPin()
+        if acPinTarget then pinLbl.Text="  📌 "..acPinTarget.DisplayName; pinLbl.TextColor3=C.teal
+        else pinLbl.Text="  Auto (nearest)"; pinLbl.TextColor3=C.sub end
     end
-    RefreshPinLbl()
+    RefPin()
     pinBtn.MouseButton1Click:Connect(function()
-        local list = {}
-        for _, p in ipairs(Players:GetPlayers()) do if p ~= LP then list[#list+1] = p end end
-        if #list == 0 then acPinTarget = nil; RefreshPinLbl(); return end
-        if not acPinTarget then
-            acPinTarget = list[1]
+        local list={}; for _,p in ipairs(Players:GetPlayers()) do if p~=LP then list[#list+1]=p end end
+        if #list==0 then acPinTarget=nil; RefPin(); return end
+        if not acPinTarget then acPinTarget=list[1]
         else
-            local found = false
-            for i, p in ipairs(list) do
-                if p == acPinTarget then acPinTarget = list[i % #list + 1]; found = true; break end
+            local found=false
+            for i,p in ipairs(list) do
+                if p==acPinTarget then acPinTarget=list[i%#list+1]; found=true; break end
             end
-            if not found then acPinTarget = list[1] end
+            if not found then acPinTarget=list[1] end
         end
-        RefreshPinLbl()
+        RefPin()
     end)
 
-    MakeDivider(sc, O()); MakeSection(sc, "  🔴  Anti Curve", O())
-    MakeToggle(sc, "Anti Curve",
+    Div(sc,O()); Section(sc,"  🔴  Anti Curve",O())
+    MakeToggle(sc,"Anti Curve",
         function() return S.AntiCurve end,
-        function(v)
-            S.AntiCurve = v; if not v then antiCurveActive = false end
-        end,
-        C.red, O())
-    local acN3 = MakeInfo(sc, C.subtext, O(), 13)
-    acN3.Text = "  Single-shot physics override on parry."
-    local acN4 = MakeInfo(sc, C.subtext, O(), 13)
-    acN4.Text = "  Zeroes ball spin + forces straight line toward target."
-    MakeSlider(sc, "Duration (s)", "AntiCurveDur", 0.10, 1.00, "%.2f", nil, O())
+        function(v) S.AntiCurve=v; if not v then antiActive=false end end,
+        C.red,O())
+    InfoLbl(sc,C.sub,O(),13).Text="  Single-shot physics override on parry (zeroes ball spin)."
+    MakeSlider(sc,"Duration (s)","AntiCurveDur",0.10,1.00,"%.2f",nil,O())
 
-    MakeDivider(sc, O()); MakeSection(sc, "  📊  Live Status", O())
-    local AeroLiveLbl = MakeInfo(sc, C.orange, O(), 16)
-    local CurveLbl    = MakeInfo(sc, C.purple, O(), 15)
-    local ACLbl       = MakeInfo(sc, C.red,    O(), 14)
-    local HomingLbl   = MakeInfo(sc, C.subtext,O(), 14)
+    Div(sc,O()); Section(sc,"  📊  Live",O())
+    local AeroLive  = InfoLbl(sc,C.orange,O(),15)
+    local CurveLive = InfoLbl(sc,C.purple,O(),14)
+    local ACLive    = InfoLbl(sc,C.red,   O(),14)
+    local HomeLive  = InfoLbl(sc,C.sub,   O(),14)
 
-    _G.__Z0M_UpdateCurve = function()
-        RefreshAeroCard()
+    _G.__Z0M_UpdateDetect = function()
+        RefAero(); RefPin()
         if S.AeroDetect then
-            if aeroDetected then
-                AeroLiveLbl.TextColor3 = C.orange
-                AeroLiveLbl.Text = string.format("⚡ AERO SLASH  +%.0fms  (%.1fs left)",
-                    S.AeroThreshBoost, math.max(0, aeroExpiry - tick()))
-            else
-                AeroLiveLbl.TextColor3 = C.subtext
-                AeroLiveLbl.Text = string.format("Aero: watching  base %.0f  peak %.0f u/s",
-                    aeroBaselineSpd, aeroPeakSpd)
-            end
-        else
-            AeroLiveLbl.TextColor3 = C.subtext; AeroLiveLbl.Text = "Aero detection: OFF"
-        end
-        if S.CurveDetection then
-            local curving = IsCurving()
-            CurveLbl.TextColor3 = curving and C.purple or C.subtext
-            CurveLbl.Text = curving
-                and string.format("ω = %.2f rad/s   CURVING (TTI blend active)", curveAngVel)
-                or  "Ball: straight path"
-            HomingLbl.Text = string.format("Homing bias: %.0f%%", curveHomingBias * 100)
-            HomingLbl.TextColor3 = curveHomingBias > 0.5 and C.orange or C.subtext
-        else
-            CurveLbl.Text = "Curve Detection: OFF"; CurveLbl.TextColor3 = C.subtext
-            HomingLbl.Text = "Homing bias: N/A"
-        end
+            AeroLive.TextColor3=aeroDetected and C.orange or C.sub
+            AeroLive.Text=aeroDetected
+                and string.format("⚡ AERO  +%.0fms  (%.1fs left)",S.AeroBoost,math.max(0,aeroExpiry-tick()))
+                or  string.format("Aero: watching  base %.0f  peak %.0f u/s",aeroBase,aeroPeak)
+        else AeroLive.Text="Aero: OFF"; AeroLive.TextColor3=C.sub end
+
+        if S.CurveDetect then
+            local curving=IsCurving()
+            CurveLive.TextColor3=curving and C.purple or C.sub
+            CurveLive.Text=string.format("ω=%.2f rad/s  %s",curveAngVel,curving and "CURVING" or "(straight)")
+            HomeLive.Text=string.format("Homing bias: %.0f%%",homingBias*100)
+            HomeLive.TextColor3=homingBias>0.5 and C.orange or C.sub
+        else CurveLive.Text="Curve: OFF"; CurveLive.TextColor3=C.sub; HomeLive.Text="" end
+
         if S.AntiCurve then
-            if antiCurveActive then
-                ACLbl.TextColor3 = C.red
-                ACLbl.Text = string.format("⬤ STRAIGHTENED  (flag expires %.2fs)", math.max(0, antiCurveExpiry - tick()))
-            else
-                ACLbl.TextColor3 = C.subtext; ACLbl.Text = "○ Anti Curve armed — fires on next parry"
-            end
-        else
-            ACLbl.TextColor3 = C.subtext; ACLbl.Text = "Anti Curve: OFF"
-        end
-        RefreshPinLbl()
+            ACLive.TextColor3=antiActive and C.red or C.sub
+            ACLive.Text=antiActive
+                and string.format("⬤ STRAIGHTENED  (%.2fs)",math.max(0,antiExpiry-tick()))
+                or  "○ Armed — fires on next parry"
+        else ACLive.Text="Anti Curve: OFF"; ACLive.TextColor3=C.sub end
     end
 end
 
--- ═══════════════════════════════ VISUAL TAB ══
+-- ═════════════════════════════ TAB: VISUAL ══
 do
-    local sc = tabScrolls["Visual"]; local o = 0; local function O() o = o+1; return o end
-    MakeSection(sc, "  👤  Player ESP", O()); MakeDivider(sc, O())
-    MakeToggle(sc, "Player Name ESP",
-        function() return S.PlayerNameESP end,
-        function(v) S.PlayerNameESP = v; ApplyAllESP() end,
-        Color3.fromRGB(255,228,50), O())
-    local n1 = MakeInfo(sc, C.subtext, O(), 13); n1.Text = "  Names above heads. Red = shooter targeting you."
-    MakeToggle(sc, "Player Ability ESP",
-        function() return S.PlayerAbilityESP end,
-        function(v) S.PlayerAbilityESP = v; ApplyAllESP() end,
-        Color3.fromRGB(100,200,255), O())
-    local n2 = MakeInfo(sc, C.subtext, O(), 13); n2.Text = "  Deep attribute scan for equipped abilities."
-    MakeDivider(sc, O()); MakeSection(sc, "  ✦  Character", O())
-    MakeToggle(sc, "Character Trail",
+    local sc=tabScrolls["Visual"]; local o=0; local function O() o=o+1; return o end
+    Section(sc,"  👤  Player ESP",O()); Div(sc,O())
+    MakeToggle(sc,"Player Name ESP",
+        function() return S.PlayerESP end,
+        function(v) S.PlayerESP=v; RebuildAllESP() end,
+        C.yellow,O())
+    InfoLbl(sc,C.sub,O(),13).Text="  Names above heads. Red = shooting at you."
+    MakeToggle(sc,"Ability ESP",
+        function() return S.AbilityESP end,
+        function(v) S.AbilityESP=v; RebuildAllESP() end,
+        C.blue,O())
+    InfoLbl(sc,C.sub,O(),13).Text="  Scans all attributes for equipped ability."
+    Div(sc,O()); Section(sc,"  ✦  Character",O())
+    MakeToggle(sc,"Character Trail",
         function() return S.CharTrail end,
-        function(v) S.CharTrail = v; if LP.Character then ApplyTrail(LP.Character) end end,
-        C.accent2, O())
-    MakeDivider(sc, O()); MakeSection(sc, "  🖥  Overlay", O())
-    MakeToggle(sc, "CPS Counter Overlay",
-        function() return S.ShowCPSCounter end,
-        function(v) S.ShowCPSCounter = v; if _G.__Z0M_CPSOverlay then _G.__Z0M_CPSOverlay.Visible = v end end,
-        C.accent, O())
-    local h1 = MakeInfo(sc, C.subtext, O(), 14); h1.Text = "  Drag the overlay anywhere on screen."
-
+        function(v) S.CharTrail=v; if LP.Character then ApplyTrail(LP.Character) end end,
+        C.accent2,O())
+    Div(sc,O()); Section(sc,"  🖥  Overlay",O())
+    MakeToggle(sc,"CPS Counter",
+        function() return S.ShowCPS end,
+        function(v) S.ShowCPS=v; if _G.__Z0M_CPSOv then _G.__Z0M_CPSOv.Visible=v end end,
+        C.accent,O())
+    InfoLbl(sc,C.sub,O(),13).Text="  Drag overlay anywhere on screen."
     if not isMobile then
-        MakeDivider(sc, O()); MakeSection(sc, "  ⌨  Menu Keybind", O())
-        local MBRow = Instance.new("Frame", sc)
-        MBRow.Size = UDim2.new(0.9,0,0,38); MBRow.BackgroundColor3 = C.panel
-        MBRow.BorderSizePixel = 0; MBRow.LayoutOrder = O()
-        Instance.new("UICorner", MBRow).CornerRadius = UDim.new(0, 8)
-        local MBLbl = Instance.new("TextLabel", MBRow)
-        MBLbl.Size = UDim2.new(0,90,1,0); MBLbl.Position = UDim2.new(0,12,0,0)
-        MBLbl.BackgroundTransparency = 1; MBLbl.Font = Enum.Font.Gotham; MBLbl.TextSize = 12
-        MBLbl.TextColor3 = C.text; MBLbl.TextXAlignment = Enum.TextXAlignment.Left
-        MBLbl.Text = "Show/Hide"; MBLbl.ZIndex = 3
-        local MBBtn = Instance.new("TextButton", MBRow)
-        MBBtn.Size = UDim2.new(0,84,0,24); MBBtn.Position = UDim2.new(1,-94,0.5,-12)
-        MBBtn.BackgroundColor3 = C.track; MBBtn.BorderSizePixel = 0; MBBtn.Font = Enum.Font.GothamBold
-        MBBtn.TextSize = 11; MBBtn.TextColor3 = C.accent; MBBtn.AutoButtonColor = false; MBBtn.ZIndex = 4
-        Instance.new("UICorner", MBBtn).CornerRadius = UDim.new(0, 6)
-        local mbListening = false
-        local function UpdateMBLbl()
-            if mbListening then
-                MBBtn.Text = "Press key..."; MBBtn.TextColor3 = Color3.fromRGB(255,255,100)
-                MBBtn.BackgroundColor3 = Color3.fromRGB(38,34,18)
-            else
-                MBBtn.Text = tostring(S.MenuKey):gsub("Enum%.KeyCode%.","")
-                MBBtn.TextColor3 = C.accent; MBBtn.BackgroundColor3 = C.track
-            end
+        Div(sc,O()); Section(sc,"  ⌨  Menu Keybind",O())
+        local MKRow=Instance.new("Frame",sc)
+        MKRow.Size=UDim2.new(0.92,0,0,36); MKRow.BackgroundColor3=C.panel
+        MKRow.BorderSizePixel=0; MKRow.LayoutOrder=O(); Corner(7,MKRow)
+        local MKLbl=Instance.new("TextLabel",MKRow)
+        MKLbl.Size=UDim2.new(0.5,0,1,0); MKLbl.Position=UDim2.new(0,12,0,0)
+        MKLbl.BackgroundTransparency=1; MKLbl.Font=Enum.Font.Gotham; MKLbl.TextSize=12
+        MKLbl.TextColor3=C.text; MKLbl.TextXAlignment=Enum.TextXAlignment.Left
+        MKLbl.Text="Show/Hide Menu"; MKLbl.ZIndex=3
+        local MKBtn=Instance.new("TextButton",MKRow)
+        MKBtn.Size=UDim2.new(0,80,0,22); MKBtn.Position=UDim2.new(1,-90,0.5,-11)
+        MKBtn.BackgroundColor3=C.track; MKBtn.BorderSizePixel=0; MKBtn.Font=Enum.Font.GothamBold
+        MKBtn.TextSize=11; MKBtn.TextColor3=C.accent; MKBtn.AutoButtonColor=false; MKBtn.ZIndex=4; Corner(5,MKBtn)
+        local mbListen=false
+        local function SyncMK()
+            if mbListen then MKBtn.Text="Press..."; MKBtn.TextColor3=C.yellow; MKBtn.BackgroundColor3=Color3.fromRGB(35,30,12)
+            else MKBtn.Text=tostring(S.MenuKey):gsub("Enum%.KeyCode%.",""); MKBtn.TextColor3=C.accent; MKBtn.BackgroundColor3=C.track end
         end
-        UpdateMBLbl()
-        MBBtn.MouseButton1Click:Connect(function() mbListening = true; UpdateMBLbl() end)
-        _G.__Z0M_MenuBindListening = function() return mbListening end
-        _G.__Z0M_MenuBindSet       = function(k) mbListening = false; S.MenuKey = k; UpdateMBLbl() end
-        _G.__Z0M_MenuBindCancel    = function()  mbListening = false; UpdateMBLbl() end
+        SyncMK()
+        MKBtn.MouseButton1Click:Connect(function() mbListen=true; SyncMK() end)
+        _G.__Z0M_MKListen = function() return mbListen end
+        _G.__Z0M_MKSet    = function(k) mbListen=false; S.MenuKey=k; SyncMK() end
+        _G.__Z0M_MKCancel = function()  mbListen=false; SyncMK() end
     else
-        _G.__Z0M_MenuBindListening = function() return false end
-        _G.__Z0M_MenuBindSet       = function() end
-        _G.__Z0M_MenuBindCancel    = function() end
-        MakeDivider(sc, O()); MakeSection(sc, "  ⚡  Mobile Buttons", O())
-        local mNote = MakeInfo(sc, C.subtext, O(), 36)
-        mNote.Text = "  ⚡ (bottom-right) — tap to show/hide menu\n  TRIGGERBOT button (bottom-left) — toggle\n  Both buttons are draggable."
+        _G.__Z0M_MKListen=function() return false end
+        _G.__Z0M_MKSet=function() end; _G.__Z0M_MKCancel=function() end
+        Div(sc,O()); Section(sc,"  📱  Mobile",O())
+        InfoLbl(sc,C.sub,O(),38).Text="  ⚡ (bottom-right): tap = toggle menu, drag = move\n  TRIGGERBOT button (bottom-left): tap = toggle\n  Both buttons are draggable."
     end
 end
 
--- ═════════════════════════ TRIGGERBOT TAB ══
+-- ═════════════════════════════ TAB: TRIGGERBOT ══
 do
-    local sc = tabScrolls["Triggerbot"]; local o = 0; local function O() o = o+1; return o end
+    local sc=tabScrolls["Triggerbot"]; local o=0; local function O() o=o+1; return o end
 
-    local TBStatusLbl = Instance.new("TextLabel", sc)
-    TBStatusLbl.Size = UDim2.new(0.9,0,0,isMobile and 38 or 28)
-    TBStatusLbl.BackgroundColor3 = C.panel; TBStatusLbl.BackgroundTransparency = 0
-    TBStatusLbl.Font = Enum.Font.GothamBold; TBStatusLbl.TextSize = isMobile and 14 or 12
-    TBStatusLbl.TextXAlignment = Enum.TextXAlignment.Center; TBStatusLbl.ZIndex = 3; TBStatusLbl.LayoutOrder = O()
-    Instance.new("UICorner", TBStatusLbl).CornerRadius = UDim.new(0, 8)
+    local TBStat=Instance.new("TextLabel",sc)
+    TBStat.Size=UDim2.new(0.92,0,0,isMobile and 36 or 28); TBStat.BackgroundColor3=C.panel
+    TBStat.BackgroundTransparency=0; TBStat.Font=Enum.Font.GothamBold
+    TBStat.TextSize=isMobile and 13 or 11; TBStat.TextXAlignment=Enum.TextXAlignment.Center
+    TBStat.ZIndex=3; TBStat.LayoutOrder=O(); Corner(7,TBStat)
 
-    local function RefreshTBStatus()
-        TBStatusLbl.Text = tbActive and "⬤  TRIGGERBOT  FIRING"
-            or S.TBEnabled and "○  TRIGGERBOT  ARMED" or "○  TRIGGERBOT  OFF"
-        TBStatusLbl.TextColor3 = tbActive and C.red
-            or S.TBEnabled and Color3.fromRGB(255,200,60) or C.subtext
-        TBStatusLbl.BackgroundColor3 = tbActive and Color3.fromRGB(40,6,6) or C.panel
+    local function RefTBStat()
+        TBStat.Text = tbActive and "⬤  TRIGGERBOT  FIRING"
+            or (S.TBEnabled and "○  TRIGGERBOT  ARMED" or "○  TRIGGERBOT  OFF")
+        TBStat.TextColor3 = tbActive and C.red or (S.TBEnabled and C.yellow or C.sub)
+        TBStat.BackgroundColor3 = tbActive and Color3.fromRGB(38,6,6) or C.panel
     end
-    RefreshTBStatus(); _G.__Z0M_RefreshTBStatus = RefreshTBStatus
+    RefTBStat(); _G.__Z0M_RefreshTBStatus=RefTBStat
 
-    MakeDivider(sc, O()); MakeSection(sc, "  🎯  Triggerbot", O())
-    MakeToggle(sc, "Enable Triggerbot",
+    Div(sc,O()); Section(sc,"  🎯  Triggerbot",O())
+    MakeToggle(sc,"Enable Triggerbot",
         function() return S.TBEnabled end,
-        function(v)
-            S.TBEnabled = v
-            if not v then if tbActive then DeactivateTriggerbot() end; tbToggleOn = false end
-            RefreshTBStatus()
-        end,
-        C.red, O())
-    local cn = MakeInfo(sc, C.orange, O(), 20)
-    cn.Text = "  ⚠ Auto Parry pauses while Triggerbot fires"
+        function(v) S.TBEnabled=v; if not v and tbActive then DeactivateTB() end; RefTBStat() end,
+        C.red,O())
+    InfoLbl(sc,C.orange,O(),18).Text="  ⚠ Auto Parry suspends while Triggerbot fires."
 
-    MakeDivider(sc, O()); MakeSection(sc, "  ⚡  Mode", O())
-    local ModeRow = Instance.new("Frame", sc)
-    ModeRow.Size = UDim2.new(0.9,0,0,isMobile and 44 or 36); ModeRow.BackgroundColor3 = C.panel
-    ModeRow.BorderSizePixel = 0; ModeRow.LayoutOrder = O()
-    Instance.new("UICorner", ModeRow).CornerRadius = UDim.new(0, 8)
-    local MLbl = Instance.new("TextLabel", ModeRow)
-    MLbl.Size = UDim2.new(0,50,1,0); MLbl.Position = UDim2.new(0,12,0,0)
-    MLbl.BackgroundTransparency = 1; MLbl.Font = Enum.Font.Gotham; MLbl.TextSize = 12
-    MLbl.TextColor3 = C.text; MLbl.TextXAlignment = Enum.TextXAlignment.Left; MLbl.Text = "Mode"; MLbl.ZIndex = 3
-
-    local function PillBtn(label, xOff)
-        local b = Instance.new("TextButton", ModeRow)
-        b.Size = UDim2.new(0,66,0,26); b.Position = UDim2.new(1,xOff,0.5,-13)
-        b.Font = Enum.Font.GothamBold; b.TextSize = 11; b.Text = label
-        b.BorderSizePixel = 0; b.AutoButtonColor = false; b.ZIndex = 4
-        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-        return b
+    Div(sc,O()); Section(sc,"  ⚡  Mode",O())
+    local MRow=Instance.new("Frame",sc)
+    MRow.Size=UDim2.new(0.92,0,0,isMobile and 42 or 34); MRow.BackgroundColor3=C.panel
+    MRow.BorderSizePixel=0; MRow.LayoutOrder=O(); Corner(7,MRow)
+    local MLabel=Instance.new("TextLabel",MRow)
+    MLabel.Size=UDim2.new(0,46,1,0); MLabel.Position=UDim2.new(0,12,0,0)
+    MLabel.BackgroundTransparency=1; MLabel.Font=Enum.Font.Gotham; MLabel.TextSize=12
+    MLabel.TextColor3=C.text; MLabel.TextXAlignment=Enum.TextXAlignment.Left; MLabel.Text="Mode"; MLabel.ZIndex=3
+    local function PBtn(lbl,xOff)
+        local b=Instance.new("TextButton",MRow)
+        b.Size=UDim2.new(0,62,0,24); b.Position=UDim2.new(1,xOff,0.5,-12)
+        b.Font=Enum.Font.GothamBold; b.TextSize=11; b.Text=lbl
+        b.BorderSizePixel=0; b.AutoButtonColor=false; b.ZIndex=4; Corner(5,b); return b
     end
-    local HoldBtn = PillBtn("Hold", -138); local TglBtn = PillBtn("Toggle", -68)
-
-    local TBHintLbl = MakeInfo(sc, C.subtext, 999)
-    local function RefreshModeBtns()
-        local hold = S.TBMode == "hold"
-        HoldBtn.BackgroundColor3 = hold and C.accent2 or C.track
-        HoldBtn.TextColor3 = hold and Color3.new(1,1,1) or C.subtext
-        TglBtn.BackgroundColor3 = not hold and C.accent2 or C.track
-        TglBtn.TextColor3 = not hold and Color3.new(1,1,1) or C.subtext
+    local HoldBtn=PBtn("Hold",-130); local TglBtn=PBtn("Toggle",-64)
+    local HintLbl=InfoLbl(sc,C.sub,999)
+    local function RefMode()
+        local hold=S.TBMode=="hold"
+        HoldBtn.BackgroundColor3=hold and C.accent2 or C.track; HoldBtn.TextColor3=hold and Color3.new(1,1,1) or C.sub
+        TglBtn.BackgroundColor3=not hold and C.accent2 or C.track; TglBtn.TextColor3=not hold and Color3.new(1,1,1) or C.sub
+        HintLbl.Text=hold and "  Hold key → fires. Release → stops." or "  Press once → fires. Press again → stops."
     end
-    RefreshModeBtns()
-
-    local function RefreshHint()
-        TBHintLbl.Text = S.TBMode == "hold"
-            and "  Hold key → fires. Release → stops."
-            or  "  Press key → fires. Press again → stops."
-    end
-    RefreshHint()
+    RefMode()
     HoldBtn.MouseButton1Click:Connect(function()
-        S.TBMode = "hold"; tbToggleOn = false
-        if tbActive then DeactivateTriggerbot() end
-        RefreshModeBtns(); RefreshTBStatus(); RefreshHint()
+        S.TBMode="hold"; tbToggleOn=false; if tbActive then DeactivateTB() end; RefMode(); RefTBStat()
     end)
     TglBtn.MouseButton1Click:Connect(function()
-        S.TBMode = "toggle"
-        if tbActive then DeactivateTriggerbot() end
-        tbToggleOn = false; RefreshModeBtns(); RefreshTBStatus(); RefreshHint()
+        S.TBMode="toggle"; tbToggleOn=false; if tbActive then DeactivateTB() end; RefMode(); RefTBStat()
     end)
 
     if not isMobile then
-        MakeDivider(sc, O()); MakeSection(sc, "  ⌨  Keybind", O())
-        local BindRow = Instance.new("Frame", sc)
-        BindRow.Size = UDim2.new(0.9,0,0,38); BindRow.BackgroundColor3 = C.panel
-        BindRow.BorderSizePixel = 0; BindRow.LayoutOrder = O()
-        Instance.new("UICorner", BindRow).CornerRadius = UDim.new(0, 8)
-        local BLbl = Instance.new("TextLabel", BindRow)
-        BLbl.Size = UDim2.new(0,80,1,0); BLbl.Position = UDim2.new(0,12,0,0)
-        BLbl.BackgroundTransparency = 1; BLbl.Font = Enum.Font.Gotham; BLbl.TextSize = 12
-        BLbl.TextColor3 = C.text; BLbl.TextXAlignment = Enum.TextXAlignment.Left
-        BLbl.Text = "Keybind"; BLbl.ZIndex = 3
-        local BindBtn = Instance.new("TextButton", BindRow)
-        BindBtn.Size = UDim2.new(0,84,0,24); BindBtn.Position = UDim2.new(1,-94,0.5,-12)
-        BindBtn.BackgroundColor3 = C.track; BindBtn.BorderSizePixel = 0
-        BindBtn.Font = Enum.Font.GothamBold; BindBtn.TextSize = 11; BindBtn.TextColor3 = C.accent
-        BindBtn.AutoButtonColor = false; BindBtn.ZIndex = 4
-        Instance.new("UICorner", BindBtn).CornerRadius = UDim.new(0, 6)
-        local tbListening = false
-        local function UpdateBindLbl()
-            if tbListening then
-                BindBtn.Text = "Press key..."; BindBtn.TextColor3 = Color3.fromRGB(255,255,100)
-                BindBtn.BackgroundColor3 = Color3.fromRGB(38,34,18)
-            else
-                BindBtn.Text = tostring(S.TBKey):gsub("Enum%.KeyCode%.","")
-                BindBtn.TextColor3 = C.accent; BindBtn.BackgroundColor3 = C.track
-            end
+        Div(sc,O()); Section(sc,"  ⌨  Keybind",O())
+        local BRow=Instance.new("Frame",sc)
+        BRow.Size=UDim2.new(0.92,0,0,36); BRow.BackgroundColor3=C.panel
+        BRow.BorderSizePixel=0; BRow.LayoutOrder=O(); Corner(7,BRow)
+        local BLbl=Instance.new("TextLabel",BRow)
+        BLbl.Size=UDim2.new(0.5,0,1,0); BLbl.Position=UDim2.new(0,12,0,0)
+        BLbl.BackgroundTransparency=1; BLbl.Font=Enum.Font.Gotham; BLbl.TextSize=12
+        BLbl.TextColor3=C.text; BLbl.TextXAlignment=Enum.TextXAlignment.Left; BLbl.Text="Keybind"; BLbl.ZIndex=3
+        local BBtn=Instance.new("TextButton",BRow)
+        BBtn.Size=UDim2.new(0,80,0,22); BBtn.Position=UDim2.new(1,-90,0.5,-11)
+        BBtn.BackgroundColor3=C.track; BBtn.BorderSizePixel=0; BBtn.Font=Enum.Font.GothamBold
+        BBtn.TextSize=11; BBtn.TextColor3=C.accent; BBtn.AutoButtonColor=false; BBtn.ZIndex=4; Corner(5,BBtn)
+        local tbListen=false
+        local function SyncBind()
+            if tbListen then BBtn.Text="Press..."; BBtn.TextColor3=C.yellow; BBtn.BackgroundColor3=Color3.fromRGB(35,30,12)
+            else BBtn.Text=tostring(S.TBKey):gsub("Enum%.KeyCode%.",""); BBtn.TextColor3=C.accent; BBtn.BackgroundColor3=C.track end
         end
-        UpdateBindLbl()
-        BindBtn.MouseButton1Click:Connect(function() tbListening = true; UpdateBindLbl() end)
-        _G.__Z0M_TBListening  = function() return tbListening end
-        _G.__Z0M_TBSetBind    = function(k) tbListening = false; S.TBKey = k; UpdateBindLbl() end
-        _G.__Z0M_TBCancelBind = function()  tbListening = false; UpdateBindLbl() end
+        SyncBind()
+        BBtn.MouseButton1Click:Connect(function() tbListen=true; SyncBind() end)
+        _G.__Z0M_TBListen = function() return tbListen end
+        _G.__Z0M_TBSet    = function(k) tbListen=false; S.TBKey=k; SyncBind() end
+        _G.__Z0M_TBCancel = function()  tbListen=false; SyncBind() end
     else
-        _G.__Z0M_TBListening  = function() return false end
-        _G.__Z0M_TBSetBind    = function() end
-        _G.__Z0M_TBCancelBind = function() end
-        MakeDivider(sc, O()); MakeSection(sc, "  📱  Mobile — TBOT Button", O())
-        local mbNote = MakeInfo(sc, C.subtext, O(), 40)
-        mbNote.Text = "  The TRIGGERBOT button (bottom-left) toggles\n  on/off with a single tap.\n  Green = firing, Red = off. Drag it anywhere."
+        _G.__Z0M_TBListen=function() return false end
+        _G.__Z0M_TBSet=function() end; _G.__Z0M_TBCancel=function() end
     end
 
-    TBHintLbl.LayoutOrder = O()
-    MakeDivider(sc, O()); MakeSection(sc, "  ⚡  Speed", O())
-    _G.__Z0M_CpsRefresh = {}
+    HintLbl.LayoutOrder=O()
+    Div(sc,O()); Section(sc,"  ⚡  CPS Speed",O())
+    _G.__Z0M_CpsSync={}
 
-    local function MakeCPSBlock(parent, label, key, minV, maxV, isExp)
-        local NC = Instance.new("Frame", parent)
-        NC.Size = UDim2.new(0.9,0,0,isMobile and 90 or 78); NC.BackgroundColor3 = C.panel
-        NC.BorderSizePixel = 0; NC.LayoutOrder = o; o = o+1
-        Instance.new("UICorner", NC).CornerRadius = UDim.new(0, 8)
-        if isExp then
-            local s = Instance.new("UIStroke", NC); s.Color = C.orange; s.Thickness = 1; s.Transparency = 0.5
+    local function CPSBlock(label, key, maxCps, isExp)
+        local NC=Instance.new("Frame",sc)
+        NC.Size=UDim2.new(0.92,0,0,isMobile and 86 or 74); NC.BackgroundColor3=C.panel
+        NC.BorderSizePixel=0; NC.LayoutOrder=o; o=o+1; Corner(8,NC)
+        if isExp then Stroke(C.orange,1,NC).Transparency=0.5 end
+
+        local TopRow=Instance.new("Frame",NC); TopRow.Size=UDim2.new(1,0,0,34); TopRow.BackgroundTransparency=1
+        local Lbl=Instance.new("TextLabel",TopRow)
+        Lbl.Size=UDim2.new(1,-58,1,0); Lbl.Position=UDim2.new(0,12,0,0)
+        Lbl.BackgroundTransparency=1; Lbl.Font=Enum.Font.Gotham; Lbl.TextSize=12
+        Lbl.TextColor3=C.text; Lbl.TextXAlignment=Enum.TextXAlignment.Left; Lbl.Text=label; Lbl.ZIndex=3
+        local Trk2=Instance.new("Frame",TopRow)
+        Trk2.Size=UDim2.new(0,36,0,20); Trk2.Position=UDim2.new(1,-48,0.5,-10)
+        Trk2.BorderSizePixel=0; Corner(10,Trk2)
+        local KP=Instance.new("Frame",Trk2); KP.Size=UDim2.new(0,13,0,13); KP.BorderSizePixel=0
+        KP.BackgroundColor3=Color3.fromRGB(240,238,228); Corner(7,KP)
+
+        local kSz2=isMobile and 20 or 13
+        local ST=Instance.new("Frame",NC)
+        ST.Size=UDim2.new(0.86,0,0,isMobile and 8 or 4); ST.Position=UDim2.new(0.07,0,1,-20)
+        ST.BackgroundColor3=C.track; ST.BorderSizePixel=0; Corner(3,ST)
+        local onC=isExp and C.orange or C.green
+        local iR2=math.clamp((S[key]-10)/(maxCps-10),0,1)
+        local F2=Instance.new("Frame",ST); F2.Size=UDim2.new(iR2,0,1,0); F2.BorderSizePixel=0; Corner(3,F2)
+        local SK2=Instance.new("TextButton",ST)
+        SK2.Size=UDim2.new(0,kSz2,0,kSz2); SK2.Position=UDim2.new(iR2,-kSz2/2,0.5,-kSz2/2)
+        SK2.BorderSizePixel=0; SK2.Text=""; SK2.ZIndex=5; Corner(kSz2,SK2)
+        local VL=Instance.new("TextLabel",NC)
+        VL.Size=UDim2.new(1,-10,0,14); VL.Position=UDim2.new(0,12,0,34)
+        VL.BackgroundTransparency=1; VL.Font=Enum.Font.Gotham; VL.TextSize=11
+        VL.TextXAlignment=Enum.TextXAlignment.Left; VL.ZIndex=3
+
+        local function SyncCPS()
+            local active=(isExp==S.TBUseExp)
+            Trk2.BackgroundColor3=active and onC or C.track
+            KP.Position=active and UDim2.new(1,-15,0.5,-6.5) or UDim2.new(0,3,0.5,-6.5)
+            F2.BackgroundColor3=active and onC or C.sub; SK2.BackgroundColor3=active and onC or C.sub
+            VL.TextColor3=active and C.text or C.sub; VL.Text=string.format("%d CPS",S[key])
         end
-        local TopRow = Instance.new("Frame", NC)
-        TopRow.Size = UDim2.new(1,0,0,36); TopRow.BackgroundTransparency = 1
-        local Lbl = Instance.new("TextLabel", TopRow)
-        Lbl.Size = UDim2.new(1,-62,1,0); Lbl.Position = UDim2.new(0,12,0,0)
-        Lbl.BackgroundTransparency = 1; Lbl.Font = Enum.Font.Gotham; Lbl.TextSize = 12
-        Lbl.TextColor3 = C.text; Lbl.TextXAlignment = Enum.TextXAlignment.Left; Lbl.Text = label; Lbl.ZIndex = 3
-        local Trk = Instance.new("Frame", TopRow)
-        Trk.Size = UDim2.new(0,38,0,22); Trk.Position = UDim2.new(1,-50,0.5,-11)
-        Trk.BorderSizePixel = 0; Instance.new("UICorner", Trk).CornerRadius = UDim.new(1,0)
-        local KP = Instance.new("Frame", Trk)
-        KP.Size = UDim2.new(0,14,0,14); KP.BorderSizePixel = 0
-        KP.BackgroundColor3 = Color3.fromRGB(240,238,228)
-        Instance.new("UICorner", KP).CornerRadius = UDim.new(1, 0)
-        local kSz = isMobile and 22 or 14
-        local ST = Instance.new("Frame", NC)
-        ST.Size = UDim2.new(0.86,0,0,isMobile and 8 or 5); ST.Position = UDim2.new(0.07,0,1,-22)
-        ST.BackgroundColor3 = C.track; ST.BorderSizePixel = 0
-        Instance.new("UICorner", ST).CornerRadius = UDim.new(1, 0)
-        local iR = math.clamp((S[key] - minV) / (maxV - minV), 0, 1)
-        local F = Instance.new("Frame", ST); F.Size = UDim2.new(iR,0,1,0); F.BorderSizePixel = 0
-        Instance.new("UICorner", F).CornerRadius = UDim.new(1, 0)
-        local SK = Instance.new("TextButton", ST)
-        SK.Size = UDim2.new(0,kSz,0,kSz); SK.Position = UDim2.new(iR,-kSz/2,0.5,-kSz/2)
-        SK.BorderSizePixel = 0; SK.Text = ""; SK.ZIndex = 5
-        Instance.new("UICorner", SK).CornerRadius = UDim.new(1, 0)
-        local VL = Instance.new("TextLabel", NC)
-        VL.Size = UDim2.new(1,-10,0,16); VL.Position = UDim2.new(0,12,0,36)
-        VL.BackgroundTransparency = 1; VL.Font = Enum.Font.Gotham; VL.TextSize = 11
-        VL.TextXAlignment = Enum.TextXAlignment.Left; VL.ZIndex = 3
-        local onC = isExp and C.orange or C.green
+        SyncCPS(); table.insert(_G.__Z0M_CpsSync,SyncCPS)
 
-        local function Refresh()
-            local active = isExp == S.TBUseExp
-            Trk.BackgroundColor3 = active and onC or C.track
-            KP.Position = active and UDim2.new(1,-17,0.5,-7) or UDim2.new(0,3,0.5,-7)
-            F.BackgroundColor3 = active and (isExp and Color3.fromRGB(255,150,40) or C.accent) or C.subtext
-            SK.BackgroundColor3 = active and C.accent or C.subtext
-            VL.TextColor3 = active and C.text or C.subtext
-            VL.Text = string.format("%d CPS  (target)", S[key])
-        end
-        Refresh()
-        table.insert(_G.__Z0M_CpsRefresh, Refresh)
-
-        local Hit = Instance.new("TextButton", TopRow)
-        Hit.Size = UDim2.new(1,0,1,0); Hit.BackgroundTransparency = 1; Hit.Text = ""; Hit.ZIndex = 5
-        Hit.MouseButton1Click:Connect(function()
-            S.TBUseExp = isExp
-            for _, f in ipairs(_G.__Z0M_CpsRefresh) do f() end
+        local Hit2=Instance.new("TextButton",TopRow)
+        Hit2.Size=UDim2.new(1,0,1,0); Hit2.BackgroundTransparency=1; Hit2.Text=""; Hit2.ZIndex=5
+        Hit2.MouseButton1Click:Connect(function()
+            S.TBUseExp=isExp; for _,f in ipairs(_G.__Z0M_CpsSync) do f() end
         end)
 
-        local slideInput = nil
-        local function cpsApply(screenX)
-            local w = ST.AbsoluteSize.X; if w == 0 then return end
-            local r = math.clamp((screenX - ST.AbsolutePosition.X) / w, 0, 1)
-            S[key] = math.floor(minV + (maxV - minV) * r + 0.5)
-            F.Size = UDim2.new(r,0,1,0); SK.Position = UDim2.new(r,-kSz/2,0.5,-kSz/2)
-            VL.Text = string.format("%d CPS  (target)", S[key])
+        local function CpsApply(sx)
+            local w=ST.AbsoluteSize.X; if w==0 then return end
+            local r=math.clamp((sx-ST.AbsolutePosition.X)/w,0,1)
+            S[key]=math.floor(10+(maxCps-10)*r+0.5)
+            F2.Size=UDim2.new(r,0,1,0); SK2.Position=UDim2.new(r,-kSz2/2,0.5,-kSz2/2)
+            VL.Text=string.format("%d CPS",S[key])
         end
-        local function cpsBegin(input)
-            if slideInput then return end
-            if input.UserInputType ~= Enum.UserInputType.MouseButton1
-                and input.UserInputType ~= Enum.UserInputType.Touch then return end
-            slideInput = input; cpsApply(input.Position.X)
+        local function StartCps(i)
+            local t=i.UserInputType
+            if t~=Enum.UserInputType.MouseButton1 and t~=Enum.UserInputType.Touch then return end
+            _slide=CpsApply; CpsApply(i.Position.X)
         end
-        local function cpsMove(input)
-            if input ~= slideInput then return end; cpsApply(input.Position.X)
-        end
-        local function cpsEnd(input)
-            if input == slideInput then slideInput = nil end
-        end
-        ST.InputBegan:Connect(cpsBegin); ST.InputChanged:Connect(cpsMove); ST.InputEnded:Connect(cpsEnd)
-        SK.InputBegan:Connect(cpsBegin); SK.InputChanged:Connect(cpsMove); SK.InputEnded:Connect(cpsEnd)
+        ST.InputBegan:Connect(StartCps); SK2.InputBegan:Connect(StartCps)
     end
 
-    MakeCPSBlock(sc, "Speed  (10 – 150 CPS)", "TBCps",    10,  150, false)
-    MakeDivider(sc, O())
-    local ExSL = Instance.new("TextLabel", sc)
-    ExSL.Size = UDim2.new(0.9,0,0,14); ExSL.BackgroundTransparency = 1
-    ExSL.Font = Enum.Font.GothamBold; ExSL.TextSize = 10
-    ExSL.TextXAlignment = Enum.TextXAlignment.Left; ExSL.ZIndex = 3; ExSL.LayoutOrder = O()
-    ExSL.Text = "  ⚠  EXPERIMENTAL"; ExSL.TextColor3 = C.orange
-    MakeCPSBlock(sc, "Speed  (10 – 500 CPS)", "TBExpCps", 10,  500, true)
+    CPSBlock("Normal  (10–150 CPS)","TBCps",150,false)
+    Div(sc,O())
+    local ExpLbl=Instance.new("TextLabel",sc); ExpLbl.Size=UDim2.new(0.92,0,0,13)
+    ExpLbl.BackgroundTransparency=1; ExpLbl.Font=Enum.Font.GothamBold; ExpLbl.TextSize=9
+    ExpLbl.TextXAlignment=Enum.TextXAlignment.Left; ExpLbl.ZIndex=3; ExpLbl.LayoutOrder=O()
+    ExpLbl.Text="  ⚠  EXPERIMENTAL (may be detected)"; ExpLbl.TextColor3=C.orange
+    CPSBlock("Experimental  (10–500 CPS)","TBExpCps",500,true)
 end
 
--- ════════════════════════════════ FPS TAB ══
+-- ═════════════════════════════ TAB: FPS ══
 do
-    local sc = tabScrolls["FPS"]; local o = 0; local function O() o = o+1; return o end
+    local sc=tabScrolls["FPS"]; local o=0; local function O() o=o+1; return o end
 
-    local FPSBanner = Instance.new("Frame", sc)
-    FPSBanner.Size = UDim2.new(0.9,0,0,54); FPSBanner.BackgroundColor3 = C.panel
-    FPSBanner.BorderSizePixel = 0; FPSBanner.LayoutOrder = O()
-    Instance.new("UICorner", FPSBanner).CornerRadius = UDim.new(0, 8)
-    local FPSBannerStroke = Instance.new("UIStroke", FPSBanner)
-    FPSBannerStroke.Color = C.lime; FPSBannerStroke.Thickness = 1; FPSBannerStroke.Transparency = 0.5
+    local Banner=Instance.new("Frame",sc); Banner.Size=UDim2.new(0.92,0,0,52)
+    Banner.BackgroundColor3=C.panel; Banner.BorderSizePixel=0; Banner.LayoutOrder=O(); Corner(8,Banner)
+    local BanStroke=Stroke(C.lime,1,Banner); BanStroke.Transparency=0.4
+    local FNow=Instance.new("TextLabel",Banner)
+    FNow.Size=UDim2.new(0.55,0,1,0); FNow.Position=UDim2.new(0,12,0,0)
+    FNow.BackgroundTransparency=1; FNow.Font=Enum.Font.GothamBold; FNow.TextSize=26
+    FNow.TextColor3=C.lime; FNow.TextXAlignment=Enum.TextXAlignment.Left; FNow.ZIndex=3; FNow.Text="60"
+    local FUnit=Instance.new("TextLabel",Banner)
+    FUnit.Size=UDim2.new(0.45,0,0,12); FUnit.Position=UDim2.new(0,12,0,34)
+    FUnit.BackgroundTransparency=1; FUnit.Font=Enum.Font.Gotham; FUnit.TextSize=9
+    FUnit.TextColor3=C.sub; FUnit.TextXAlignment=Enum.TextXAlignment.Left; FUnit.ZIndex=3; FUnit.Text="FPS now"
+    local FGain=Instance.new("TextLabel",Banner)
+    FGain.Size=UDim2.new(0.42,0,1,0); FGain.Position=UDim2.new(0.55,0,0,0)
+    FGain.BackgroundTransparency=1; FGain.Font=Enum.Font.GothamBold; FGain.TextSize=13
+    FGain.TextColor3=C.sub; FGain.TextXAlignment=Enum.TextXAlignment.Right; FGain.ZIndex=3; FGain.Text=""
 
-    local FPSNowLbl = Instance.new("TextLabel", FPSBanner)
-    FPSNowLbl.Size = UDim2.new(0.5,0,1,0); FPSNowLbl.Position = UDim2.new(0,14,0,0)
-    FPSNowLbl.BackgroundTransparency = 1; FPSNowLbl.Font = Enum.Font.GothamBold
-    FPSNowLbl.TextSize = 26; FPSNowLbl.TextColor3 = C.lime
-    FPSNowLbl.TextXAlignment = Enum.TextXAlignment.Left; FPSNowLbl.ZIndex = 3; FPSNowLbl.Text = "60"
-
-    local FPSUnitLbl = Instance.new("TextLabel", FPSBanner)
-    FPSUnitLbl.Size = UDim2.new(0.5,-14,0,14); FPSUnitLbl.Position = UDim2.new(0,14,0,34)
-    FPSUnitLbl.BackgroundTransparency = 1; FPSUnitLbl.Font = Enum.Font.Gotham; FPSUnitLbl.TextSize = 10
-    FPSUnitLbl.TextColor3 = C.subtext; FPSUnitLbl.TextXAlignment = Enum.TextXAlignment.Left
-    FPSUnitLbl.ZIndex = 3; FPSUnitLbl.Text = "FPS now"
-
-    local FPSGainLbl = Instance.new("TextLabel", FPSBanner)
-    FPSGainLbl.Size = UDim2.new(0.45,0,1,0); FPSGainLbl.Position = UDim2.new(0.5,0,0,0)
-    FPSGainLbl.BackgroundTransparency = 1; FPSGainLbl.Font = Enum.Font.GothamBold; FPSGainLbl.TextSize = 14
-    FPSGainLbl.TextColor3 = C.subtext; FPSGainLbl.TextXAlignment = Enum.TextXAlignment.Right
-    FPSGainLbl.ZIndex = 3; FPSGainLbl.Text = ""
-
-    MakeDivider(sc, O())
-    local BtnRow = Instance.new("Frame", sc)
-    BtnRow.Size = UDim2.new(0.9,0,0,38); BtnRow.BackgroundTransparency = 1
-    BtnRow.BorderSizePixel = 0; BtnRow.LayoutOrder = O()
-    local NukeBtn = Instance.new("TextButton", BtnRow)
-    NukeBtn.Size = UDim2.new(0.48,0,1,0); NukeBtn.Position = UDim2.new(0,0,0,0)
-    NukeBtn.BackgroundColor3 = C.lime; NukeBtn.BorderSizePixel = 0; NukeBtn.Font = Enum.Font.GothamBold
-    NukeBtn.TextSize = 11; NukeBtn.TextColor3 = Color3.fromRGB(0,0,0); NukeBtn.Text = "⚡ Nuke All"
-    NukeBtn.AutoButtonColor = false; NukeBtn.ZIndex = 4
-    Instance.new("UICorner", NukeBtn).CornerRadius = UDim.new(0, 8)
-    local RestBtn = Instance.new("TextButton", BtnRow)
-    RestBtn.Size = UDim2.new(0.48,0,1,0); RestBtn.Position = UDim2.new(0.52,0,0,0)
-    RestBtn.BackgroundColor3 = Color3.fromRGB(55,44,72); RestBtn.BorderSizePixel = 0
-    RestBtn.Font = Enum.Font.GothamBold; RestBtn.TextSize = 11; RestBtn.TextColor3 = C.subtext
-    RestBtn.Text = "↺ Restore All"; RestBtn.AutoButtonColor = false; RestBtn.ZIndex = 4
-    Instance.new("UICorner", RestBtn).CornerRadius = UDim.new(0, 8)
+    Div(sc,O())
+    local BtnRow=Instance.new("Frame",sc)
+    BtnRow.Size=UDim2.new(0.92,0,0,36); BtnRow.BackgroundTransparency=1; BtnRow.BorderSizePixel=0; BtnRow.LayoutOrder=O()
+    local function FBtn(lbl,xsc,bg,tc)
+        local b=Instance.new("TextButton",BtnRow)
+        b.Size=UDim2.new(0.48,0,1,0); b.Position=UDim2.new(xsc,0,0,0)
+        b.BackgroundColor3=bg; b.BorderSizePixel=0; b.Font=Enum.Font.GothamBold
+        b.TextSize=11; b.TextColor3=tc; b.Text=lbl; b.AutoButtonColor=false; b.ZIndex=4; Corner(7,b); return b
+    end
+    local NukeBtn=FBtn("⚡ Nuke All",   0,    C.lime,                 Color3.fromRGB(0,0,0))
+    local RestBtn=FBtn("↺ Restore",    0.52, Color3.fromRGB(55,44,72),C.sub)
     NukeBtn.MouseButton1Click:Connect(function()
-        NukeAll(); NukeBtn.Text = "✓ Nuked!"
-        task.delay(1.5, function() NukeBtn.Text = "⚡ Nuke All" end)
+        NukeAll(); NukeBtn.Text="✓ Done!"
+        task.delay(1.5,function() NukeBtn.Text="⚡ Nuke All" end)
     end)
     RestBtn.MouseButton1Click:Connect(function()
-        RestoreAll(); fpsBaseline = 0; RestBtn.Text = "✓ Restored!"
-        task.delay(1.5, function() RestBtn.Text = "↺ Restore All" end)
+        RestoreAll(); fpsBaseline=0; RestBtn.Text="✓ Restored!"
+        task.delay(1.5,function() RestBtn.Text="↺ Restore" end)
     end)
 
-    local fpsToggleSyncs = {}
-    local function MakeFPSToggle(label, note, key, color)
-        local ord = O()
-        local sync = MakeToggle(sc, label,
+    local fpsSyncs={}
+    local function FPSTgl(lbl,note,key,col)
+        local ord=O()
+        local sync=MakeToggle(sc,lbl,
             function() return FPS[key] end,
             function(v)
-                if v and fpsBaseline == 0 then fpsBaseline = rawFPS end
-                SetFPSFeature(key, v)
-                if _G.__Z0M_RefreshFPS then _G.__Z0M_RefreshFPS() end
+                if v and fpsBaseline==0 then fpsBaseline=rawFPS end
+                SetFPS(key,v); if _G.__Z0M_SyncFPS then _G.__Z0M_SyncFPS() end
             end,
-            color, ord)
-        fpsToggleSyncs[key] = sync
-        if note then local n = MakeInfo(sc, C.subtext, O(), 13); n.Text = "  " .. note end
+            col,ord)
+        fpsSyncs[key]=sync
+        if note then InfoLbl(sc,C.sub,O(),13).Text="  "..note end
     end
 
-    MakeDivider(sc, O()); MakeSection(sc, "  🔆  Lighting", O())
-    MakeFPSToggle("Disable Shadows",    "Biggest single FPS win on most PCs.",          "Shadows",     Color3.fromRGB(255,230,60))
-    MakeFPSToggle("Disable Post-FX",    "Removes blur, sun rays, depth of field, etc.", "PostFX",      Color3.fromRGB(255,170,40))
-    MakeFPSToggle("Disable Fog",        "Clears distance fog for cleaner renders.",      "Fog",         Color3.fromRGB(180,220,255))
-    MakeDivider(sc, O()); MakeSection(sc, "  🌿  World", O())
-    MakeFPSToggle("Disable Decorations","Removes terrain grass and leaf clutter.",       "Decorations", C.teal)
-    MakeFPSToggle("Disable Particles",  "Hides all particles, fire, smoke, trails.",    "Particles",   C.orange)
-    MakeFPSToggle("Disable Textures",   "Blanks mesh textures and decals.",             "Textures",    Color3.fromRGB(200,120,255))
-    MakeDivider(sc, O()); MakeSection(sc, "  ⚙️  Engine", O())
-    MakeFPSToggle("Minimum Quality",    "Forces QualityLevel 1 — most aggressive.",     "Quality",     C.red)
+    Div(sc,O()); Section(sc,"  🔆  Lighting",O())
+    FPSTgl("Disable Shadows",    "Biggest single gain on most hardware.",          "Shadows",     C.yellow)
+    FPSTgl("Disable Post-FX",    "Removes blur, depth-of-field, sun rays.",        "PostFX",      C.orange)
+    FPSTgl("Disable Fog",        "Removes distance fog entirely.",                 "Fog",         C.blue)
+    Div(sc,O()); Section(sc,"  🌿  World",O())
+    FPSTgl("Disable Decorations","Removes terrain grass/leaf clutter.",            "Decorations", C.teal)
+    FPSTgl("Disable Particles",  "Hides all particles, fire, smoke, trails.",     "Particles",   C.orange)
+    FPSTgl("Disable Textures",   "Blanks mesh textures and decals.",              "Textures",    C.purple)
+    Div(sc,O()); Section(sc,"  ⚙  Engine",O())
+    FPSTgl("Minimum Quality",    "Forces QualityLevel 1 — most aggressive.",      "Quality",     C.red)
 
-    _G.__Z0M_RefreshFPS = function()
-        for key, sync in pairs(fpsToggleSyncs) do sync(FPS[key]) end
-        local now = math.floor(smoothFPS); FPSNowLbl.Text = tostring(now)
-        local fc = now >= 55 and C.lime or now >= 35 and Color3.fromRGB(255,210,40) or C.red
-        FPSNowLbl.TextColor3 = fc; FPSBannerStroke.Color = fc
-        if fpsBaseline > 0 then
-            local gain = now - math.floor(fpsBaseline)
-            FPSGainLbl.TextColor3 = gain > 0 and C.lime or C.subtext
-            FPSGainLbl.Text = gain > 0 and string.format("+%d vs baseline", gain)
-                or gain == 0 and "no change yet" or string.format("%d vs baseline", gain)
-        else
-            FPSGainLbl.Text = "no baseline yet"; FPSGainLbl.TextColor3 = C.subtext
-        end
+    _G.__Z0M_SyncFPS = function()
+        for k,sync in pairs(fpsSyncs) do sync(FPS[k]) end
+        local n=math.floor(smoothFPS); FNow.Text=tostring(n)
+        local fc=n>=55 and C.lime or n>=35 and C.yellow or C.red
+        FNow.TextColor3=fc; BanStroke.Color=fc
+        if fpsBaseline>0 then
+            local g=n-math.floor(fpsBaseline)
+            FGain.TextColor3=g>0 and C.lime or C.sub
+            FGain.Text=g>0 and string.format("+%d vs start",g) or g==0 and "no change" or string.format("%d vs start",g)
+        else FGain.Text="no baseline"; FGain.TextColor3=C.sub end
     end
     _G.__Z0M_UpdateFPS = function()
         if not sc.Visible then return end
-        if _G.__Z0M_RefreshFPS then _G.__Z0M_RefreshFPS() end
+        if _G.__Z0M_SyncFPS then _G.__Z0M_SyncFPS() end
     end
 end
 
--- ═══════════════════════════════ CONFIG TAB ══
+-- ═════════════════════════════ TAB: CONFIG ══
 do
-    local sc = tabScrolls["Config"]; local o = 0; local function O() o = o+1; return o end
-    MakeSection(sc, "  💾  Saved Configs", O()); MakeDivider(sc, O())
-    local hl = MakeInfo(sc, C.subtext, O(), 15)
-    hl.Text = "  SAVE → write   LOAD → click name   DEL → clear"
-    MakeDivider(sc, O())
-    local sNBtns = {}; local sLbls = {}
+    local sc=tabScrolls["Config"]; local o=0; local function O() o=o+1; return o end
+    Section(sc,"  💾  Saved Configs",O()); Div(sc,O())
+    InfoLbl(sc,C.sub,O(),14).Text="  SAVE → write  |  click name → LOAD  |  DEL → clear"
+    Div(sc,O())
+    local sNBtns={}; local sLbls={}
 
     local function RefSlot(i)
-        local cfg = configs[i]; local btn = sNBtns[i]; local lbl = sLbls[i]
-        if not btn then return end
+        local cfg=configs[i]; local btn=sNBtns[i]; local lbl=sLbls[i]; if not btn then return end
         if cfg and cfg.data then
-            btn.Text = cfg.name or ("Config " .. i); btn.TextColor3 = C.accent
-            btn.BackgroundColor3 = C.tabSel; if lbl then lbl.Text = "  ✓ Saved"; lbl.TextColor3 = C.green end
+            btn.Text=cfg.name or("Config "..i); btn.TextColor3=C.accent; btn.BackgroundColor3=C.tabSel
+            if lbl then lbl.Text="  ✓ Saved"; lbl.TextColor3=C.green end
         else
-            btn.Text = "Slot " .. i .. "  (empty)"; btn.TextColor3 = C.subtext
-            btn.BackgroundColor3 = C.panel; if lbl then lbl.Text = "  Empty slot"; lbl.TextColor3 = C.subtext end
+            btn.Text="Slot "..i.."  (empty)"; btn.TextColor3=C.sub; btn.BackgroundColor3=C.panel
+            if lbl then lbl.Text="  Empty"; lbl.TextColor3=C.sub end
         end
     end
 
-    for i = 1, CONFIG_SLOTS do
-        local SR = Instance.new("Frame", sc)
-        SR.Size = UDim2.new(0.9,0,0,54); SR.BackgroundColor3 = C.panel
-        SR.BorderSizePixel = 0; SR.LayoutOrder = O()
-        Instance.new("UICorner", SR).CornerRadius = UDim.new(0, 8)
-        local SB = Instance.new("TextButton", SR)
-        SB.Size = UDim2.new(1,-46,0,30); SB.Position = UDim2.new(0,0,0,0)
-        SB.BackgroundColor3 = C.panel; SB.BorderSizePixel = 0; SB.Font = Enum.Font.GothamBold
-        SB.TextSize = 11; SB.TextXAlignment = Enum.TextXAlignment.Center
-        SB.AutoButtonColor = false; SB.ZIndex = 4
-        Instance.new("UICorner", SB).CornerRadius = UDim.new(0, 8); sNBtns[i] = SB
-        local SL = Instance.new("TextLabel", SR)
-        SL.Size = UDim2.new(0.7,0,0,20); SL.Position = UDim2.new(0,10,0,32)
-        SL.BackgroundTransparency = 1; SL.Font = Enum.Font.Gotham; SL.TextSize = 10
-        SL.TextXAlignment = Enum.TextXAlignment.Left; SL.ZIndex = 3; sLbls[i] = SL
-        local SaveB = Instance.new("TextButton", SR)
-        SaveB.Size = UDim2.new(0,40,0,26); SaveB.Position = UDim2.new(1,-44,0,2)
-        SaveB.BackgroundColor3 = Color3.fromRGB(20,70,28); SaveB.BorderSizePixel = 0
-        SaveB.Font = Enum.Font.GothamBold; SaveB.TextSize = 10; SaveB.TextColor3 = C.green
-        SaveB.Text = "SAVE"; SaveB.AutoButtonColor = false; SaveB.ZIndex = 5
-        Instance.new("UICorner", SaveB).CornerRadius = UDim.new(0, 6)
-        local DelB = Instance.new("TextButton", SR)
-        DelB.Size = UDim2.new(0,40,0,20); DelB.Position = UDim2.new(1,-44,0,30)
-        DelB.BackgroundColor3 = Color3.fromRGB(70,15,15); DelB.BorderSizePixel = 0
-        DelB.Font = Enum.Font.GothamBold; DelB.TextSize = 9; DelB.TextColor3 = C.red
-        DelB.Text = "DEL"; DelB.AutoButtonColor = false; DelB.ZIndex = 5
-        Instance.new("UICorner", DelB).CornerRadius = UDim.new(0, 5)
+    for i=1,CONFIG_SLOTS do
+        local SR=Instance.new("Frame",sc)
+        SR.Size=UDim2.new(0.92,0,0,52); SR.BackgroundColor3=C.panel
+        SR.BorderSizePixel=0; SR.LayoutOrder=O(); Corner(7,SR)
+        local SB=Instance.new("TextButton",SR)
+        SB.Size=UDim2.new(1,-44,0,28); SB.Position=UDim2.new(0,0,0,0)
+        SB.BackgroundColor3=C.panel; SB.BorderSizePixel=0; SB.Font=Enum.Font.GothamBold
+        SB.TextSize=11; SB.TextXAlignment=Enum.TextXAlignment.Center; SB.AutoButtonColor=false; SB.ZIndex=4
+        Corner(7,SB); sNBtns[i]=SB
+        local SL=Instance.new("TextLabel",SR)
+        SL.Size=UDim2.new(0.7,0,0,18); SL.Position=UDim2.new(0,10,0,30)
+        SL.BackgroundTransparency=1; SL.Font=Enum.Font.Gotham; SL.TextSize=10
+        SL.TextXAlignment=Enum.TextXAlignment.Left; SL.ZIndex=3; sLbls[i]=SL
+        local SaveB=Instance.new("TextButton",SR)
+        SaveB.Size=UDim2.new(0,38,0,24); SaveB.Position=UDim2.new(1,-42,0,2)
+        SaveB.BackgroundColor3=Color3.fromRGB(18,62,24); SaveB.BorderSizePixel=0
+        SaveB.Font=Enum.Font.GothamBold; SaveB.TextSize=10; SaveB.TextColor3=C.green
+        SaveB.Text="SAVE"; SaveB.AutoButtonColor=false; SaveB.ZIndex=5; Corner(5,SaveB)
+        local DelB=Instance.new("TextButton",SR)
+        DelB.Size=UDim2.new(0,38,0,18); DelB.Position=UDim2.new(1,-42,0,28)
+        DelB.BackgroundColor3=Color3.fromRGB(62,14,14); DelB.BorderSizePixel=0
+        DelB.Font=Enum.Font.GothamBold; DelB.TextSize=9; DelB.TextColor3=C.red
+        DelB.Text="DEL"; DelB.AutoButtonColor=false; DelB.ZIndex=5; Corner(4,DelB)
         RefSlot(i)
         SB.MouseButton1Click:Connect(function()
-            local cfg = configs[i]
+            local cfg=configs[i]
             if cfg and cfg.data then
-                DeserializeIntoS(cfg.data)
+                DeserializeS(cfg.data)
                 if _G.__Z0M_RefreshStatus   then _G.__Z0M_RefreshStatus()   end
                 if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
-                for _, f in ipairs(_G.__Z0M_CpsRefresh or {}) do f() end
+                for _,f in ipairs(_G.__Z0M_CpsSync or {}) do f() end
                 if LP.Character then ApplyTrail(LP.Character) end
-                ApplyAllESP()
-                if _G.__Z0M_CPSOverlay then _G.__Z0M_CPSOverlay.Visible = S.ShowCPSCounter end
-                SL.Text = "  ✓ Loaded!"; SL.TextColor3 = C.green
-                task.delay(2, function() RefSlot(i) end)
+                RebuildAllESP()
+                if _G.__Z0M_CPSOv then _G.__Z0M_CPSOv.Visible=S.ShowCPS end
+                SL.Text="  ✓ Loaded!"; SL.TextColor3=C.green; task.delay(2,function() RefSlot(i) end)
             else
-                SL.Text = "  ✗ Nothing"; SL.TextColor3 = C.red
-                task.delay(1.5, function() RefSlot(i) end)
+                SL.Text="  ✗ Empty slot"; SL.TextColor3=C.red; task.delay(1.5,function() RefSlot(i) end)
             end
         end)
         SaveB.MouseButton1Click:Connect(function()
-            if not configs[i] then configs[i] = {} end
-            configs[i].name = "Config " .. i; configs[i].data = SerializeS()
-            SaveConfigs(); RefSlot(i)
-            SL.Text = "  ✓ Saved!"; SL.TextColor3 = C.green
-            task.delay(2, function() RefSlot(i) end)
+            if not configs[i] then configs[i]={} end
+            configs[i].name="Config "..i; configs[i].data=SerializeS(); SaveConfigs(); RefSlot(i)
+            SL.Text="  ✓ Saved!"; SL.TextColor3=C.green; task.delay(2,function() RefSlot(i) end)
         end)
         DelB.MouseButton1Click:Connect(function()
-            configs[i] = { name = "Slot " .. i, data = nil }; SaveConfigs(); RefSlot(i)
+            configs[i]={name="Slot "..i,data=nil}; SaveConfigs(); RefSlot(i)
         end)
     end
 
-    MakeDivider(sc, O()); MakeSection(sc, "  ⚡  Quick Actions", O())
-    local QSB = Instance.new("TextButton", sc)
-    QSB.Size = UDim2.new(0.9,0,0,34); QSB.BackgroundColor3 = Color3.fromRGB(14,48,82)
-    QSB.BorderSizePixel = 0; QSB.LayoutOrder = O(); QSB.Font = Enum.Font.GothamBold
-    QSB.TextSize = 11; QSB.TextColor3 = C.accent; QSB.Text = "💾  Quick Save  →  Slot 1"
-    QSB.AutoButtonColor = false
-    Instance.new("UICorner", QSB).CornerRadius = UDim.new(0, 8)
-    QSB.MouseButton1Click:Connect(function()
-        configs[1] = { name = "Config 1", data = SerializeS() }; SaveConfigs()
-        for i = 1, CONFIG_SLOTS do if sNBtns[i] then RefSlot(i) end end
-        QSB.Text = "✓  Saved to Slot 1"
-        task.delay(1.8, function() QSB.Text = "💾  Quick Save  →  Slot 1" end)
+    Div(sc,O()); Section(sc,"  ⚡  Quick",O())
+    local QS=Instance.new("TextButton",sc)
+    QS.Size=UDim2.new(0.92,0,0,32); QS.BackgroundColor3=Color3.fromRGB(12,44,76)
+    QS.BorderSizePixel=0; QS.LayoutOrder=O(); QS.Font=Enum.Font.GothamBold
+    QS.TextSize=11; QS.TextColor3=C.accent; QS.Text="💾  Quick Save → Slot 1"; QS.AutoButtonColor=false; Corner(7,QS)
+    QS.MouseButton1Click:Connect(function()
+        configs[1]={name="Config 1",data=SerializeS()}; SaveConfigs()
+        for i=1,CONFIG_SLOTS do if sNBtns[i] then RefSlot(i) end end
+        QS.Text="✓  Saved to Slot 1"; task.delay(1.8,function() QS.Text="💾  Quick Save → Slot 1" end)
     end)
 end
 
--- ════════════════════════════ CPS Overlay ══
-local CPSOverlay = Instance.new("Frame", ScreenGui)
-CPSOverlay.Name               = "Z0M_CPSOverlay"
-CPSOverlay.Size               = UDim2.new(0, 170, 0, 58)
-CPSOverlay.Position           = isMobile and UDim2.new(0.5,-85,0,62) or UDim2.new(0.5,-85,0,14)
-CPSOverlay.BackgroundColor3   = Color3.fromRGB(6,7,12)
-CPSOverlay.BackgroundTransparency = 0.08; CPSOverlay.BorderSizePixel = 0
-CPSOverlay.Active             = true; CPSOverlay.Visible = S.ShowCPSCounter; CPSOverlay.ZIndex = 20
-Instance.new("UICorner", CPSOverlay).CornerRadius = UDim.new(0, 10)
-local _cSt = Instance.new("UIStroke", CPSOverlay)
-_cSt.Color = C.accent2; _cSt.Thickness = 1; _cSt.Transparency = 0.3
-local _cAccBar = Instance.new("Frame", CPSOverlay)
-_cAccBar.Size = UDim2.new(0,3,1,0); _cAccBar.BorderSizePixel = 0; _cAccBar.ZIndex = 21
-_cAccBar.BackgroundColor3 = C.accent
-local CPSTitleLbl = Instance.new("TextLabel", CPSOverlay)
-CPSTitleLbl.Size = UDim2.new(1,-8,0,14); CPSTitleLbl.Position = UDim2.new(0,8,0,4)
-CPSTitleLbl.BackgroundTransparency = 1; CPSTitleLbl.Font = Enum.Font.GothamBold; CPSTitleLbl.TextSize = 9
-CPSTitleLbl.TextColor3 = C.subtext; CPSTitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-CPSTitleLbl.Text = "CPS COUNTER"; CPSTitleLbl.ZIndex = 21
-local CPSValLbl = Instance.new("TextLabel", CPSOverlay)
-CPSValLbl.Size = UDim2.new(1,-8,0,26); CPSValLbl.Position = UDim2.new(0,8,0,15)
-CPSValLbl.BackgroundTransparency = 1; CPSValLbl.Font = Enum.Font.GothamBold; CPSValLbl.TextSize = 21
-CPSValLbl.TextColor3 = C.accent; CPSValLbl.TextXAlignment = Enum.TextXAlignment.Left
-CPSValLbl.Text = "0 CPS"; CPSValLbl.ZIndex = 21
-local CPSFpsLbl = Instance.new("TextLabel", CPSOverlay)
-CPSFpsLbl.Size = UDim2.new(1,-8,0,12); CPSFpsLbl.Position = UDim2.new(0,8,0,44)
-CPSFpsLbl.BackgroundTransparency = 1; CPSFpsLbl.Font = Enum.Font.Gotham; CPSFpsLbl.TextSize = 9
-CPSFpsLbl.TextColor3 = C.subtext; CPSFpsLbl.TextXAlignment = Enum.TextXAlignment.Left
-CPSFpsLbl.Text = "FPS: 60  |  Ping: 0ms"; CPSFpsLbl.ZIndex = 21
-_G.__Z0M_CPSOverlay = CPSOverlay
-MakeDraggable(CPSOverlay, CPSOverlay)
+-- ═══════════════════════════════ CPS OVERLAY ══
+local CPSOv=Instance.new("Frame",ScreenGui)
+CPSOv.Name="Z0M_CPSOv"; CPSOv.Size=UDim2.new(0,168,0,56)
+CPSOv.Position=isMobile and UDim2.new(0.5,-84,0,60) or UDim2.new(0.5,-84,0,12)
+CPSOv.BackgroundColor3=C.bg; CPSOv.BackgroundTransparency=0.06; CPSOv.BorderSizePixel=0
+CPSOv.Active=true; CPSOv.Visible=S.ShowCPS; CPSOv.ZIndex=20; Corner(10,CPSOv)
+Stroke(C.accent2,1,CPSOv).Transparency=0.3
+local CAccBar=Instance.new("Frame",CPSOv); CAccBar.Size=UDim2.new(0,3,1,0); CAccBar.BorderSizePixel=0
+CAccBar.BackgroundColor3=C.accent; CAccBar.ZIndex=21
+local CTitleLbl=Instance.new("TextLabel",CPSOv)
+CTitleLbl.Size=UDim2.new(1,-8,0,13); CTitleLbl.Position=UDim2.new(0,8,0,3)
+CTitleLbl.BackgroundTransparency=1; CTitleLbl.Font=Enum.Font.GothamBold; CTitleLbl.TextSize=9
+CTitleLbl.TextColor3=C.sub; CTitleLbl.TextXAlignment=Enum.TextXAlignment.Left; CTitleLbl.Text="CPS COUNTER"; CTitleLbl.ZIndex=21
+local CValLbl=Instance.new("TextLabel",CPSOv)
+CValLbl.Size=UDim2.new(1,-8,0,24); CValLbl.Position=UDim2.new(0,8,0,14)
+CValLbl.BackgroundTransparency=1; CValLbl.Font=Enum.Font.GothamBold; CValLbl.TextSize=20
+CValLbl.TextColor3=C.accent; CValLbl.TextXAlignment=Enum.TextXAlignment.Left; CValLbl.Text="0 CPS"; CValLbl.ZIndex=21
+local CSubLbl=Instance.new("TextLabel",CPSOv)
+CSubLbl.Size=UDim2.new(1,-8,0,12); CSubLbl.Position=UDim2.new(0,8,0,42)
+CSubLbl.BackgroundTransparency=1; CSubLbl.Font=Enum.Font.Gotham; CSubLbl.TextSize=9
+CSubLbl.TextColor3=C.sub; CSubLbl.TextXAlignment=Enum.TextXAlignment.Left; CSubLbl.Text="FPS:60 | Ping:0ms"; CSubLbl.ZIndex=21
+_G.__Z0M_CPSOv=CPSOv
+MakeDraggable(CPSOv,CPSOv)
 
--- ════════════════════════════ Input Handler ══
-Track(UserInputService.InputBegan:Connect(function(i, gpe)
-    if _G.__Z0M_MenuBindListening and _G.__Z0M_MenuBindListening() then
-        if i.UserInputType == Enum.UserInputType.Keyboard then
-            if i.KeyCode == Enum.KeyCode.Escape then _G.__Z0M_MenuBindCancel()
-            else _G.__Z0M_MenuBindSet(i.KeyCode) end
-        end; return
-    end
-    if _G.__Z0M_TBListening and _G.__Z0M_TBListening() then
-        if i.UserInputType == Enum.UserInputType.Keyboard then
-            if i.KeyCode == Enum.KeyCode.Escape then _G.__Z0M_TBCancelBind()
-            else _G.__Z0M_TBSetBind(i.KeyCode) end
-        end; return
-    end
-    if gpe then return end
-    if not isMobile then
-        if S.TBEnabled and i.KeyCode == S.TBKey then
-            if S.TBMode == "hold" then
-                ActivateTriggerbot()
-            else
-                tbToggleOn = not tbToggleOn
-                if tbToggleOn then ActivateTriggerbot() else DeactivateTriggerbot() end
-            end
-            if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
-        end
-        if i.KeyCode == Enum.KeyCode.F then
-            if not tbActive then
-                S.AutoParry = not S.AutoParry
-                if _G.__Z0M_RefreshStatus then _G.__Z0M_RefreshStatus() end
-            end
-        end
-        if i.KeyCode == S.MenuKey then
-            if Main then Main.Visible = not Main.Visible end
-        end
-    end
-end))
-
-Track(UserInputService.InputEnded:Connect(function(i)
-    if not isMobile and S.TBEnabled and S.TBMode == "hold" and i.KeyCode == S.TBKey then
-        DeactivateTriggerbot()
-        if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
-    end
-end))
-
-SwitchTab("Main")
-ApplyAllESP()
-
--- Minimize / Close
-local minimized = false
+-- ══════════════════════════════ HEADER BUTTONS ══
+local minimized=false
 MinBtn.MouseButton1Click:Connect(function()
     if isMobile then
-        Main.Visible = false
-        TweenService:Create(ToggleBtn, TweenInfo.new(0.12), {
-            BackgroundColor3 = Color3.fromRGB(10,11,20)
-        }):Play()
+        Main.Visible=false
+        TweenService:Create(ToggleBtn,TweenInfo.new(0.12),{BackgroundColor3=Color3.fromRGB(10,11,20)}):Play()
         return
     end
-    minimized = not minimized
-    TweenService:Create(Main, TweenInfo.new(0.2, Enum.EasingStyle.Quart), {
-        Size = minimized and UDim2.new(0,W,0,H_MIN) or UDim2.new(0,W,0,H_FULL)
+    minimized=not minimized
+    TweenService:Create(Main,TweenInfo.new(0.18,Enum.EasingStyle.Quart),{
+        Size=minimized and UDim2.new(0,W,0,HMIN) or UDim2.new(0,W,0,HFUL)
     }):Play()
-    MinBtn.Text = minimized and "+" or "─"
+    MinBtn.Text=minimized and "+" or "─"
 end)
-
 CloseBtn.MouseButton1Click:Connect(function()
-    TweenService:Create(Main, TweenInfo.new(0.2,Enum.EasingStyle.Back,Enum.EasingDirection.In),
-        {Size=UDim2.new(0,0,0,0)}):Play()
-    task.delay(0.25, function() ScreenGui:Destroy() end)
+    TweenService:Create(Main,TweenInfo.new(0.18,Enum.EasingStyle.Back,Enum.EasingDirection.In),{Size=UDim2.new(0,0,0,0)}):Play()
+    task.delay(0.25,function() ScreenGui:Destroy() end)
 end)
-
-for _, btn in ipairs({ MinBtn, CloseBtn }) do
-    local orig = btn.BackgroundColor3
+for _,btn in ipairs({MinBtn,CloseBtn}) do
+    local orig=btn.BackgroundColor3
     btn.MouseEnter:Connect(function()
-        TweenService:Create(btn, TweenInfo.new(0.1), {
-            BackgroundColor3 = btn == CloseBtn
-                and Color3.fromRGB(210,50,50) or Color3.fromRGB(40,38,62)
+        TweenService:Create(btn,TweenInfo.new(0.1),{
+            BackgroundColor3=btn==CloseBtn and Color3.fromRGB(210,50,50) or Color3.fromRGB(38,36,58)
         }):Play()
     end)
     btn.MouseLeave:Connect(function()
-        TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3=orig}):Play()
+        TweenService:Create(btn,TweenInfo.new(0.1),{BackgroundColor3=orig}):Play()
     end)
 end
 
--- ════════════════════════════ Live GUI Update ══
-local guiTick = 0
-Track(RunService.Heartbeat:Connect(function(dt)
-    guiTick = guiTick + dt; if guiTick < 0.05 then return end; guiTick = 0
-    if _G.__Z0M_UpdateMain  then _G.__Z0M_UpdateMain()  end
-    if _G.__Z0M_UpdateCurve then _G.__Z0M_UpdateCurve() end
-    if _G.__Z0M_UpdateFPS   then _G.__Z0M_UpdateFPS()   end
-    if S.ShowCPSCounter and CPSOverlay.Visible then
-        local tCps = S.TBUseExp and S.TBExpCps or S.TBCps
-        if tbActive then
-            CPSValLbl.Text = string.format("%d / %d CPS", cpsActual, tCps)
-            CPSValLbl.TextColor3 = C.red; CPSTitleLbl.Text = "CPS  (FIRING)"
-        else
-            CPSValLbl.Text = string.format("%d CPS", tCps)
-            CPSValLbl.TextColor3 = C.accent; CPSTitleLbl.Text = "CPS COUNTER"
+-- ════════════════════════════ INPUT HANDLER ══
+Con(UIS.InputBegan:Connect(function(i, gpe)
+    -- Keybind capture
+    if _G.__Z0M_MKListen and _G.__Z0M_MKListen() then
+        if i.UserInputType==Enum.UserInputType.Keyboard then
+            if i.KeyCode==Enum.KeyCode.Escape then _G.__Z0M_MKCancel()
+            else _G.__Z0M_MKSet(i.KeyCode) end
+        end; return
+    end
+    if _G.__Z0M_TBListen and _G.__Z0M_TBListen() then
+        if i.UserInputType==Enum.UserInputType.Keyboard then
+            if i.KeyCode==Enum.KeyCode.Escape then _G.__Z0M_TBCancel()
+            else _G.__Z0M_TBSet(i.KeyCode) end
+        end; return
+    end
+    if gpe then return end
+    if not isMobile and i.UserInputType==Enum.UserInputType.Keyboard then
+        -- Triggerbot key
+        if S.TBEnabled and i.KeyCode==S.TBKey then
+            if S.TBMode=="hold" then ActivateTB()
+            else tbToggleOn=not tbToggleOn; if tbToggleOn then ActivateTB() else DeactivateTB() end end
         end
-        local fc = smoothFPS >= 55 and C.green or smoothFPS >= 35 and Color3.fromRGB(255,210,40) or C.red
-        CPSFpsLbl.TextColor3 = fc
-        CPSFpsLbl.Text = string.format("FPS: %.0f  |  Ping: %.0fms", smoothFPS, displayPing)
+        -- Quick parry toggle (F)
+        if i.KeyCode==Enum.KeyCode.F and not tbActive then
+            S.AutoParry=not S.AutoParry
+            if _G.__Z0M_RefreshStatus then _G.__Z0M_RefreshStatus() end
+        end
+        -- Menu key
+        if i.KeyCode==S.MenuKey then Main.Visible=not Main.Visible end
     end
 end))
 
-print(string.format("[z0mware v2.0] loaded  mobile=%s  ball=%s  players=%d",
-    tostring(isMobile), currentBall and currentBall.Name or "waiting", #Players:GetPlayers()))
+Con(UIS.InputEnded:Connect(function(i)
+    if not isMobile and S.TBEnabled and S.TBMode=="hold" and i.KeyCode==S.TBKey then
+        DeactivateTB()
+    end
+end))
+
+-- ═══════════════════════════ LIVE GUI UPDATE ══
+local guiT=0
+Con(RunService.Heartbeat:Connect(function(dt)
+    guiT=guiT+dt; if guiT<0.05 then return end; guiT=0
+
+    if _G.__Z0M_UpdateMain   then _G.__Z0M_UpdateMain()   end
+    if _G.__Z0M_UpdateDetect then _G.__Z0M_UpdateDetect() end
+    if _G.__Z0M_UpdateFPS    then _G.__Z0M_UpdateFPS()    end
+
+    if S.ShowCPS and CPSOv.Visible then
+        local tgt = S.TBUseExp and S.TBExpCps or S.TBCps
+        if tbActive then
+            CValLbl.Text=string.format("%d / %d CPS",cpsActual,tgt)
+            CValLbl.TextColor3=C.red; CTitleLbl.Text="CPS  (FIRING)"
+        else
+            CValLbl.Text=string.format("%d CPS",tgt)
+            CValLbl.TextColor3=C.accent; CTitleLbl.Text="CPS COUNTER"
+        end
+        local fc=smoothFPS>=55 and C.green or smoothFPS>=35 and C.yellow or C.red
+        CSubLbl.TextColor3=fc
+        CSubLbl.Text=string.format("FPS:%.0f | Ping:%.0fms",smoothFPS,displayPing)
+    end
+end))
+
+-- ═══════════════════════════════════════ INIT ══
+SwitchTab("Main")
+RebuildAllESP()
+
+print(string.format("[z0mware v3.0] loaded  mobile=%s  ball=%s  players=%d",
+    tostring(isMobile),
+    currentBall and currentBall.Name or "waiting",
+    #Players:GetPlayers()))
