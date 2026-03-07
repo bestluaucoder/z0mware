@@ -1,7 +1,7 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════╗
-║               z0mware — Blade Ball  v3.1                         ║
-║               Polished · All features fixed · Best timing        ║
+║               z0mware — Blade Ball  v3.2                         ║
+║               All features match spec · Full API exposed         ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  LOADSTRING:                                                     ║
 ║    _G.Z0M = { TBExpCps=469, TBUseExp=true, AutoTiming=true }     ║
@@ -14,20 +14,22 @@
 ║    F             → toggle Auto Parry                             ║
 ║    LAlt (hold)   → triggerbot (default, configurable)            ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  CHANGES vs v3.0:                                                ║
-║   • Fix: AntiCurve uses currentBall directly (no _G.__Z0M_ball)  ║
-║   • Fix: Ball re-check at 0.10s (was 0.15s) → faster lock       ║
-║   • Fix: MIN_REFIRE 0.30 → 0.25s for faster re-parry            ║
-║   • Fix: CPS uses timestamp ring-buffer for accuracy             ║
-║   • Fix: State card shows parry state with color pulse           ║
-║   • Fix: Config saves TBKey/MenuKey human-readable               ║
-║   • Improve: CURVE_THRESH 0.20 → 0.15 rad/s (catch more curves) ║
-║   • Improve: TTI bar in live stats (visual feedback)             ║
-║   • Improve: Aero EMA 0.08 → 0.10 (faster spike response)       ║
-║   • Improve: Threshold auto-display clamps to 0–500ms            ║
-║   • Improve: AutoTiming toggle updates MinFireDist slider label  ║
-║   • Improve: FPS Nuke remembers baseline per-feature             ║
-║   • Improve: Mobile TB button pulse animation on active          ║
+║  _G.Z0M API (after load):                                        ║
+║    _G.Z0M.ToggleAutoParry(bool)                                  ║
+║    _G.Z0M.ToggleTriggerbot(bool)                                 ║
+║    _G.Z0M.SetSetting(key, value)                                 ║
+║    _G.Z0M.GetSettings()  → returns settings table copy          ║
+║    _G.Z0M.NukeFPS()                                              ║
+║    _G.Z0M.RestoreFPS()                                           ║
+╠══════════════════════════════════════════════════════════════════╣
+║  FIXES vs v3.1:                                                  ║
+║   • _G.Z0M now exposed as a full callable API after load         ║
+║   • Compensation display now shows exact per-component           ║
+║     breakdown matching GetThreshold() — same math, no drift      ║
+║   • Homing bias now shows raw acceleration value not %           ║
+║   • CompLbl multipliers unified with GetThreshold() values       ║
+║   • GetThresholdComponents() helper returns each part so the     ║
+║     display and the actual logic always stay in sync             ║
 ╚══════════════════════════════════════════════════════════════════╝
 --]]
 
@@ -80,7 +82,7 @@ local S = {
     MenuKey      = Enum.KeyCode.RightControl,
 }
 
--- _G.Z0M or legacy _G.Z0M_Settings injection
+-- ── Settings injection (pre-load, from _G.Z0M or legacy _G.Z0M_Settings) ──
 local _extCfg = (type(_G.Z0M) == "table" and _G.Z0M)
              or (type(_G.Z0M_Settings) == "table" and _G.Z0M_Settings)
 if _extCfg then
@@ -132,7 +134,8 @@ local function MakeDraggable(frame, handle, thresh, movedRef)
     handle.InputBegan:Connect(function(i)
         local t = i.UserInputType
         if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then return end
-        _drag = {frame=frame, origin=i.Position, startPos=frame.Position, thresh=thresh, movedRef=movedRef}
+        _drag = {frame=frame, origin=i.Position, startPos=frame.Position,
+                 thresh=thresh, movedRef=movedRef}
     end)
 end
 
@@ -145,7 +148,8 @@ do
         end
     end
     for _, n in ipairs({
-        "z0mware_v1","z0mware_v11","z0mware_v20","z0mware_v21","z0mware_v30","z0mware_v31",
+        "z0mware_v1","z0mware_v11","z0mware_v20","z0mware_v21",
+        "z0mware_v30","z0mware_v31","z0mware_v32",
         "NoEnemiesHub_v72","NoEnemiesHub_v71","NoEnemiesHub_v70",
     }) do Kill(n) end
 end
@@ -181,7 +185,7 @@ local function UpdateFPS(dt)
 end
 
 -- ════════════════════════════ AERO DETECTION ══
--- Detects Aerodynamic Slash via 1.68× speed spike above EMA baseline.
+-- Detects Aerodynamic Slash: tracks ball speed EMA; spike ≥ 1.68× = detected.
 local aeroDetected = false
 local aeroExpiry   = 0
 local aeroBase     = 0
@@ -194,7 +198,6 @@ local function UpdateAero(ball)
     local z = ball:FindFirstChild("zoomies"); if not z then return end
     local spd = z.VectorVelocity.Magnitude; if spd < 2 then return end
     local now = tick()
-    -- v3.1: faster EMA (0.10) for quicker spike response
     aeroBase = aeroBase + 0.10 * (spd - aeroBase)
     if spd > aeroPeak then aeroPeak = spd end
     if aeroBase >= AERO_MIN and spd >= aeroBase * AERO_SPIKE then
@@ -208,16 +211,17 @@ local function ResetAero()
 end
 
 -- ═════════════════════════════ CURVE ENGINE ══
--- v3.1: CURVE_THRESH lowered 0.20 → 0.15 rad/s to catch more curve abilities
 local CURVE_THRESH  = 0.15
-local CURVE_SAMPLES = 14  -- slightly more history for stability
+local CURVE_SAMPLES = 14
 local cBuf = {}; local cPtr = 1
-local curveAngVel = 0; local curveAxis = Vector3.new(0,1,0); local homingBias = 0
+local curveAngVel = 0; local curveAxis = Vector3.new(0,1,0)
+-- homingAccel: raw acceleration magnitude toward player (u/s²), matching spec description
+local homingAccel = 0
 for i=1,CURVE_SAMPLES do cBuf[i]={pos=Vector3.zero, vel=Vector3.zero, t=0} end
 
 local function CurveClear()
     for i=1,CURVE_SAMPLES do cBuf[i]={pos=Vector3.zero, vel=Vector3.zero, t=0} end
-    cPtr=1; curveAngVel=0; curveAxis=Vector3.new(0,1,0); homingBias=0
+    cPtr=1; curveAngVel=0; curveAxis=Vector3.new(0,1,0); homingAccel=0
 end
 
 local function CurveSample(ball)
@@ -234,11 +238,13 @@ local function CurveAnalyse()
     if aM < 1 or bM < 1 then return end
     local aD = a.vel/aM; local bD = b.vel/bM
     local dot = math.clamp(aD:Dot(bD), -1, 1)
-    -- EMA factor 0.22 for stable tracking without noise
     curveAngVel = curveAngVel + 0.22 * (math.acos(dot)/dt - curveAngVel)
     local ax = bD:Cross(aD)
     if ax.Magnitude > 0.0001 then curveAxis = ax.Unit end
-    homingBias = math.clamp(math.abs(aM-bM)/dt/200, 0, 1)
+    -- homingAccel: rate of speed change toward target (u/s²), per spec:
+    -- "velocity += target_direction * homing_strength"
+    -- We approximate homing_strength as |Δspeed| / dt
+    homingAccel = homingAccel + 0.22 * (math.abs(aM-bM)/dt - homingAccel)
 end
 
 local function IsCurving() return S.CurveDetect and curveAngVel > CURVE_THRESH end
@@ -257,17 +263,32 @@ local function CurvePredict(ball, lookahead)
 end
 
 -- ═════════════════════════════ THRESHOLD ══
+-- Single source of truth: GetThresholdComponents() returns every part.
+-- GetThreshold() sums them. GUI reads the same components — no drift.
+--
+-- Threshold breakdown:
+--   base    = 155ms (AutoTiming) or manual TriggerTime
+--   pingC   = smoothPing / 2000  (capped 40ms)
+--   fpsC    = fps penalty when FPS < 45  (capped 40ms)
+--   jitC    = sqrt(dt_variance) * 1.5  (capped 25ms)
+--   aeroC   = AeroBoost when Aero detected
+--
+local function GetThresholdComponents()
+    local base  = S.AutoTiming and 0.155 or S.TriggerTime
+    local pingC = math.clamp(smoothPing / 2000,        0, 0.040)
+    local fpsC  = fpsLow and math.clamp((60-smoothFPS)/60*0.04, 0, 0.040) or 0
+    local jitC  = math.clamp(math.sqrt(dtVar) * 1.5,  0, 0.025)
+    local aeroC = (aeroDetected and S.AeroDetect) and S.AeroBoost/1000 or 0
+    return base, pingC, fpsC, jitC, aeroC
+end
+
 local function GetThreshold()
-    local base   = S.AutoTiming and 0.155 or S.TriggerTime
-    local pingC  = math.clamp(smoothPing / 2000, 0, 0.04)
-    local fpsC   = fpsLow and math.clamp((60-smoothFPS)/60*0.04, 0, 0.04) or 0
-    local jitC   = math.clamp(math.sqrt(dtVar) * 1.5, 0, 0.025)
-    local aeroC  = (aeroDetected and S.AeroDetect) and S.AeroBoost/1000 or 0
-    return base + pingC + fpsC + jitC + aeroC
+    local b,p,f,j,a = GetThresholdComponents()
+    return b + p + f + j + a
 end
 
 -- ═════════════════════════════════ TTI ══
--- Returns math.huge if ball has no velocity → no premature fire on spawn.
+-- Returns math.huge when ball has no velocity → no premature fire on spawn.
 local function GetTTI(ball, hrp, dt)
     local z = ball:FindFirstChild("zoomies")
     if not z then return math.huge end
@@ -278,7 +299,6 @@ local function GetTTI(ball, hrp, dt)
         local dist = (hrp.Position - ball.Position).Magnitude
         local lookahead = dist / spd
         local pDist = (hrp.Position - CurvePredict(ball, lookahead)).Magnitude
-        -- Blend factor capped at 0.65 to avoid over-correction
         local blend = math.clamp((curveAngVel - CURVE_THRESH) / 0.80, 0, 0.65)
         local blended = pDist * blend + dist * (1 - blend)
         return math.max(0, blended / spd)
@@ -336,11 +356,12 @@ local function DoAutoCurve()
 end
 
 -- ═══════════════════════════════ ANTI CURVE ══
--- v3.1: Uses currentBall directly — no _G reference needed.
+-- Single-shot physics override on parry.
+-- Sets angular_velocity = 0, direction = target_vector.
+-- Ball flies straight. Ball passes ball directly — no global lookup.
 local antiActive = false; local antiExpiry = 0
 
 local function DoAntiCurve(ball)
-    -- ball is passed directly from FireParry → no global lookup needed
     if not S.AntiCurve then return end
     if not ball or not ball.Parent then return end
     local z = ball:FindFirstChild("zoomies"); if not z then return end
@@ -357,51 +378,51 @@ local function DoAntiCurve(ball)
 end
 
 -- ═══════════════════════════ PARRY STATE MACHINE ══
--- IDLE  → ARMED : ball targets LP (from IDLE only)
--- ARMED → FIRED : TTI ≤ threshold (fires once)
--- FIRED → IDLE  : ball leaves LP (safe to re-arm)
+-- States:
+--   IDLE  → ARMED : ball.target == LP.Name (from IDLE only)
+--   ARMED → FIRED : TTI ≤ threshold  (fires once)
+--   FIRED → IDLE  : ball.target ~= LP.Name (re-arms for next round)
 local IDLE  = 0
 local ARMED = 1
 local FIRED = 2
 local parryState  = IDLE
 local lastFired   = 0
-local MIN_REFIRE  = 0.25  -- v3.1: reduced 0.30 → 0.25s for faster re-parry
+local MIN_REFIRE  = 0.25
 
 local currentBall = nil
 local ballConn    = nil
 local cachedHRP   = nil
 
--- Triggerbot
+-- Triggerbot state
 local tbActive     = false
 local tbToggleOn   = false
 local tbLastFire   = 0
 local autoParryBak = true
 
--- CPS measurement — v3.1: ring buffer of actual fire timestamps
-local CPS_WIN   = 2.0  -- measure over 2-second window
-local cpsTimes  = {}   -- ring buffer of tick() values when fired
+-- CPS: ring-buffer of click timestamps over 2-second window.
+--   store click timestamps
+--   remove anything older than 2s
+--   CPS = count / 2
+local CPS_WIN  = 2.0
+local cpsTimes = {}
 local cpsActual = 0
 
 local function RecordFire()
     local now = tick()
     cpsTimes[#cpsTimes+1] = now
-    -- trim old entries
     local cutoff = now - CPS_WIN
-    local i = 1
-    while cpsTimes[i] and cpsTimes[i] < cutoff do
-        table.remove(cpsTimes, 1)
-    end
+    while cpsTimes[1] and cpsTimes[1] < cutoff do table.remove(cpsTimes,1) end
     cpsActual = math.floor(#cpsTimes / CPS_WIN + 0.5)
 end
 
 local function FireParry()
-    local ball = currentBall  -- capture before async
+    local ball = currentBall
     lastFired = tick()
     VIM:SendMouseButtonEvent(0, 0, 0, true,  game, 0)
     VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0)
     RecordFire()
     DoAutoCurve()
-    DoAntiCurve(ball)  -- v3.1: pass ball directly
+    DoAntiCurve(ball)
 end
 
 local function ActivateTB()
@@ -446,7 +467,7 @@ local function BindBall(ball)
     CurveClear(); ResetAero()
     if not ball then return end
 
-    -- Handle already-targeting-us on bind
+    -- Ball may already be targeting us on bind
     if ball:GetAttribute("target") == LP.Name then
         parryState = ARMED
     end
@@ -467,7 +488,6 @@ local function SetupBallFolder()
     Con(BallFolder.ChildAdded:Connect(function(child)
         task.spawn(function()
             if child and child.Parent then BindBall(child) end
-            -- v3.1: re-check at 0.10s (was 0.15s) for faster lock-on
             task.wait(0.10)
             local b = GetBall()
             if b and b ~= currentBall then BindBall(b) end
@@ -510,7 +530,6 @@ Con(RunService.PreSimulation:Connect(function(dt)
         cpsActual = math.floor(#cpsTimes / CPS_WIN + 0.5)
     end
 
-    -- Anti-curve expiry
     if antiActive and tick() >= antiExpiry then antiActive = false end
 
     -- ── Triggerbot ────────────────────────────────────────────────
@@ -529,7 +548,6 @@ Con(RunService.PreSimulation:Connect(function(dt)
 
     if not S.AutoParry then return end
 
-    -- Recover lost ball ref
     if not (currentBall and currentBall.Parent) then
         local b = GetBall(); if b then BindBall(b) end
     end
@@ -537,7 +555,7 @@ Con(RunService.PreSimulation:Connect(function(dt)
     local ball = currentBall; if not (ball and ball.Parent) then return end
     local hrp  = cachedHRP;   if not hrp then return end
 
-    -- Belt-and-suspenders: sync state from attribute in case signal was missed
+    -- Belt-and-suspenders: sync from attribute in case signal was missed
     local tgt = ball:GetAttribute("target")
     if tgt == LP.Name then
         if parryState == IDLE then parryState = ARMED end
@@ -555,13 +573,13 @@ Con(RunService.PreSimulation:Connect(function(dt)
     if dist < 1.5 then return end
     if not IsApproaching(ball, hrp) then return end
 
-    -- Adaptive threshold
     local threshold = GetThreshold()
     if S.AutoTiming and spd > 0.5 then
+        -- Distance floor: always fire at least MinFireDist studs away
         threshold = math.max(threshold, math.min(S.MinFireDist / spd, 2.0))
     end
 
-    -- Clash mode: fire immediately when close enough
+    -- Clash mode: fire when distance <= ClashDist
     if S.ClashMode and dist <= S.ClashDist then
         if tick() - lastFired < MIN_REFIRE then return end
         parryState = FIRED; FireParry(); return
@@ -576,7 +594,7 @@ Con(RunService.PreSimulation:Connect(function(dt)
         return
     end
 
-    -- Normal TTI-based trigger
+    -- TTI trigger: fire when TTI <= threshold
     local tti = GetTTI(ball, hrp, dt)
     if tti <= threshold then
         if tick() - lastFired < MIN_REFIRE then return end
@@ -679,8 +697,9 @@ local function BuildESP(player)
                 if not lbl.Parent then return end
                 local now=tick(); if now-lastT<0.1 then return end; lastT=now
                 local ball=currentBall
+                -- White = normal, Red = ball targeting you  (per spec)
                 lbl.TextColor3=(ball and ball.Parent and ball:GetAttribute("target")==LP.Name)
-                    and Color3.fromRGB(255,60,60) or Color3.fromRGB(255,228,60)
+                    and Color3.fromRGB(255,60,60) or Color3.fromRGB(240,238,228)
             end))
         end
 
@@ -741,7 +760,8 @@ if LP.Character then ApplyTrail(LP.Character) end
 Con(LP.CharacterAdded:Connect(ApplyTrail))
 
 -- ════════════════════════════════ FPS BOOST ══
-local FPS = {Shadows=false,Decorations=false,PostFX=false,Fog=false,Particles=false,Textures=false,Quality=false}
+local FPS = {Shadows=false,Decorations=false,PostFX=false,Fog=false,
+             Particles=false,Textures=false,Quality=false}
 local FPS_BK = {}; local fpsBaseline = 0
 
 local function FPS_Shadows(on)
@@ -848,7 +868,6 @@ end
 local CONFIG_FILE  = "z0mware_configs.json"
 local CONFIG_SLOTS = 5
 local configs      = {}
--- v3.1: complete config key list including Aero and all toggles
 local CONFIG_KEYS  = {
     "AutoParry","AutoTiming","TriggerTime","MinFireDist","ClashMode","ClashDist",
     "CurveDetect","AutoCurve","ACSnapDur","AntiCurve","AntiCurveDur",
@@ -860,7 +879,6 @@ local CONFIG_KEYS  = {
 local function SerializeS()
     local t={}
     for _,k in ipairs(CONFIG_KEYS) do t[k]=S[k] end
-    -- Store KeyCode as plain string (e.g. "LeftAlt")
     t.TBKey   = tostring(S.TBKey):gsub("Enum%.KeyCode%.","")
     t.MenuKey = tostring(S.MenuKey):gsub("Enum%.KeyCode%.","")
     return t
@@ -899,13 +917,12 @@ local function GuiRoot()
 end
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name           = "z0mware_v31"
+ScreenGui.Name           = "z0mware_v32"
 ScreenGui.ResetOnSpawn   = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.IgnoreGuiInset = true
 ScreenGui.Parent         = GuiRoot()
 
--- ── Palette ──────────────────────────────────────────────────────
 local C = {
     bg      = Color3.fromRGB(6,7,12),
     panel   = Color3.fromRGB(13,14,22),
@@ -930,7 +947,6 @@ local C = {
     blue    = Color3.fromRGB(75,185,255),
 }
 
--- ── Layout ───────────────────────────────────────────────────────
 local W    = isMobile and 350 or 390
 local HFUL = isMobile and 490 or 460
 local HMIN = 40
@@ -938,7 +954,6 @@ local HDR  = HMIN
 local TABH = isMobile and 36 or 30
 local CTOP = HDR + TABH
 
--- ── Helpers ──────────────────────────────────────────────────────
 local sliderRefs = {}
 
 local function Corner(r,p) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r); return c end
@@ -949,14 +964,12 @@ local function Div(p,ord)
     local d=Instance.new("Frame",p); d.Size=UDim2.new(0.92,0,0,1)
     d.BackgroundColor3=C.div; d.BorderSizePixel=0; d.LayoutOrder=ord
 end
-
 local function Section(p,txt,ord)
     local l=Instance.new("TextLabel",p); l.Size=UDim2.new(0.92,0,0,16)
     l.BackgroundTransparency=1; l.Font=Enum.Font.GothamBold; l.TextSize=9
     l.TextColor3=C.sub; l.TextXAlignment=Enum.TextXAlignment.Left
     l.Text=txt:upper(); l.LayoutOrder=ord; l.ZIndex=3
 end
-
 local function InfoLbl(p,col,ord,h)
     local l=Instance.new("TextLabel",p); l.Size=UDim2.new(0.92,0,0,h or 14)
     l.BackgroundTransparency=1; l.Font=Enum.Font.Gotham; l.TextSize=11
@@ -1011,8 +1024,7 @@ local function MakeSlider(p,label,key,minV,maxV,fmt,lockKey,ord)
         Lbl.Text=label..":  "..string.format(fmt,v)..(Locked() and "  [AUTO]" or "")
     end
     UpdLbl(S[key])
-    local tH = isMobile and 10 or 5
-    local kSz = isMobile and 22 or 13
+    local tH=isMobile and 10 or 5; local kSz=isMobile and 22 or 13
     local TrHit=Instance.new("TextButton",Row)
     TrHit.Size=UDim2.new(0.86,0,0,isMobile and 30 or 20)
     TrHit.Position=UDim2.new(0.07,0,1,isMobile and -34 or -24)
@@ -1026,7 +1038,6 @@ local function MakeSlider(p,label,key,minV,maxV,fmt,lockKey,ord)
     local Knob=Instance.new("Frame",Tr)
     Knob.Size=UDim2.new(0,kSz,0,kSz); Knob.Position=UDim2.new(r0,-kSz/2,0.5,-kSz/2)
     Knob.BackgroundColor3=C.accent; Knob.BorderSizePixel=0; Knob.ZIndex=5; Corner(kSz,Knob)
-
     local function SetVal(v)
         local r=math.clamp((v-minV)/(maxV-minV),0,1)
         Fill.Size=UDim2.new(r,0,1,0); Knob.Position=UDim2.new(r,-kSz/2,0.5,-kSz/2)
@@ -1034,14 +1045,12 @@ local function MakeSlider(p,label,key,minV,maxV,fmt,lockKey,ord)
         Fill.BackgroundColor3=col; Knob.BackgroundColor3=col; UpdLbl(v)
     end
     sliderRefs[key]=SetVal
-
     local function Apply(sx)
         local w=TrHit.AbsoluteSize.X; if w==0 then return end
         local r=math.clamp((sx-TrHit.AbsolutePosition.X)/w,0,1)
         S[key]=math.floor((minV+(maxV-minV)*r)*1000+0.5)/1000
         Fill.Size=UDim2.new(r,0,1,0); Knob.Position=UDim2.new(r,-kSz/2,0.5,-kSz/2); UpdLbl(S[key])
     end
-
     TrHit.InputBegan:Connect(function(i)
         local t=i.UserInputType
         if t~=Enum.UserInputType.MouseButton1 and t~=Enum.UserInputType.Touch then return end
@@ -1079,7 +1088,6 @@ ToggleBtn.BackgroundColor3=Color3.fromRGB(10,11,20); ToggleBtn.BorderSizePixel=0
 ToggleBtn.Font=Enum.Font.GothamBold; ToggleBtn.TextSize=20; ToggleBtn.Text="⚡"
 ToggleBtn.TextColor3=C.accent; ToggleBtn.AutoButtonColor=false; ToggleBtn.ZIndex=50; ToggleBtn.Active=true
 Corner(25,ToggleBtn); Stroke(C.accent2,1.5,ToggleBtn)
-
 do
     local mr={v=false}
     MakeDraggable(ToggleBtn,ToggleBtn,isMobile and 18 or 10,mr)
@@ -1107,8 +1115,6 @@ if isMobile then
     mbDot.Size=UDim2.new(0,7,0,7); mbDot.Position=UDim2.new(0,12,0.5,-3.5)
     mbDot.BorderSizePixel=0; mbDot.ZIndex=51; Corner(4,mbDot)
     local mbStroke=Stroke(Color3.fromRGB(200,40,40),1.5,MobileTBBtn)
-
-    -- v3.1: pulse animation when active
     local pulseTween = nil
     local function SyncMobileTB()
         if pulseTween then pulseTween:Cancel(); pulseTween=nil end
@@ -1117,10 +1123,8 @@ if isMobile then
             MobileTBBtn.TextColor3=Color3.fromRGB(80,230,110)
             MobileTBBtn.BackgroundColor3=Color3.fromRGB(10,38,16)
             mbStroke.Color=C.green; mbDot.BackgroundColor3=C.green
-            -- Pulse the stroke
             pulseTween=TweenService:Create(mbStroke,TweenInfo.new(0.5,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut,-1,true),
-                {Transparency=0.5})
-            pulseTween:Play()
+                {Transparency=0.5}); pulseTween:Play()
         else
             MobileTBBtn.Text="TRIGGERBOT\nTAP TOGGLE"
             MobileTBBtn.TextColor3=Color3.fromRGB(255,80,80)
@@ -1135,7 +1139,6 @@ if isMobile then
         if _G.__Z0M_RefreshTBStatus then _G.__Z0M_RefreshTBStatus() end
         if _G.__Z0M_RefreshStatus   then _G.__Z0M_RefreshStatus()   end
     end
-
     local mr={v=false}
     MakeDraggable(MobileTBBtn,MobileTBBtn,20,mr)
     MobileTBBtn.MouseButton1Click:Connect(function()
@@ -1174,7 +1177,7 @@ Header.BackgroundColor3=C.header; Header.BorderSizePixel=0; Header.ZIndex=3; Hea
 
 local TitleLbl=Instance.new("TextLabel",Header)
 TitleLbl.Size=UDim2.new(1,-80,1,0); TitleLbl.Position=UDim2.new(0,14,0,0)
-TitleLbl.BackgroundTransparency=1; TitleLbl.Text="⚡  z0mware  v3.1"
+TitleLbl.BackgroundTransparency=1; TitleLbl.Text="⚡  z0mware  v3.2"
 TitleLbl.Font=Enum.Font.GothamBold; TitleLbl.TextSize=isMobile and 14 or 13
 TitleLbl.TextColor3=C.accent; TitleLbl.TextXAlignment=Enum.TextXAlignment.Left; TitleLbl.ZIndex=4
 
@@ -1187,7 +1190,6 @@ local function HdrBtn(x,bg,txt)
 end
 local MinBtn   = HdrBtn(-62,C.panel,"─"); MinBtn.TextColor3=C.sub
 local CloseBtn = HdrBtn(-30,Color3.fromRGB(160,28,28),"✕")
-
 MakeDraggable(Main,Header)
 
 local TabBar=Instance.new("Frame",Main)
@@ -1236,18 +1238,15 @@ do
     Card.Size=UDim2.new(0.92,0,0,isMobile and 80 or 66)
     Card.BackgroundColor3=C.panel; Card.BorderSizePixel=0; Card.LayoutOrder=O(); Corner(10,Card)
     local CardStroke=Stroke(C.green,1,Card); CardStroke.Transparency=0.4
-
     local SLine=Instance.new("TextLabel",Card)
     SLine.Size=UDim2.new(1,0,0,isMobile and 22 or 18); SLine.Position=UDim2.new(0,0,0,6)
     SLine.BackgroundTransparency=1; SLine.Font=Enum.Font.GothamBold
     SLine.TextSize=isMobile and 14 or 12; SLine.TextXAlignment=Enum.TextXAlignment.Center; SLine.ZIndex=3
-
     local SubLine=Instance.new("TextLabel",Card)
     SubLine.Size=UDim2.new(1,0,0,14); SubLine.Position=UDim2.new(0,0,0,isMobile and 28 or 24)
     SubLine.BackgroundTransparency=1; SubLine.Font=Enum.Font.Gotham; SubLine.TextSize=10
     SubLine.TextXAlignment=Enum.TextXAlignment.Center; SubLine.TextColor3=C.sub; SubLine.ZIndex=3
-
-    -- v3.1: TTI progress bar in status card
+    -- TTI progress bar
     local TTIBarBg=Instance.new("Frame",Card)
     TTIBarBg.Size=UDim2.new(0.86,0,0,4); TTIBarBg.Position=UDim2.new(0.07,0,1,-10)
     TTIBarBg.BackgroundColor3=C.track; TTIBarBg.BorderSizePixel=0; TTIBarBg.ZIndex=3; Corner(2,TTIBarBg)
@@ -1262,7 +1261,7 @@ do
         local on = S.AutoParry and not tbActive
         SLine.Text      = on and "⬤  AUTO PARRY  ON" or (tbActive and "⬤  TRIGGERBOT  FIRING" or "○  AUTO PARRY  OFF")
         SLine.TextColor3= on and C.green or C.red
-        CardStroke.Color= on and C.green or (tbActive and C.red or C.red)
+        CardStroke.Color= on and C.green or C.red
         local thr = GetThreshold()
         local ball = currentBall
         local spd2 = ball and ball.Parent and ball:FindFirstChild("zoomies")
@@ -1297,17 +1296,24 @@ do
     Div(sc,O()); Section(sc,"  🎛  Tuning",O())
     MakeSlider(sc,"Trigger (s)","TriggerTime",0.10,0.55,"%.3f","AutoTiming",O())
     MakeSlider(sc,"Min fire dist","MinFireDist",3,18,"%.0f st",nil,O())
-    local n1=InfoLbl(sc,C.sub,O(),13); n1.Text="  Dist floor: fires at ≥ this many studs (AutoTiming only)"
+    InfoLbl(sc,C.sub,O(),13).Text="  Dist floor: fires at ≥ this many studs (AutoTiming only)"
     MakeSlider(sc,"Clash dist","ClashDist",4,20,"%.0f st",nil,O())
 
+    -- ── Live stats with correct compensation breakdown ──────────
     Div(sc,O()); Section(sc,"  📊  Live",O())
     local PingLbl  = InfoLbl(sc,C.cyan,   O(),15)
     local FpsLbl   = InfoLbl(sc,C.lime,   O(),14)
+    -- v3.2: Compensation now shows each component separately, matching GetThresholdComponents() exactly
+    local CompBase = InfoLbl(sc,C.sub,    O(),14)
+    local CompPing = InfoLbl(sc,C.cyan,   O(),14)
+    local CompFps  = InfoLbl(sc,C.yellow, O(),14)
+    local CompJit  = InfoLbl(sc,C.orange, O(),14)
+    local CompAero = InfoLbl(sc,C.orange, O(),14)
+    local CompFin  = InfoLbl(sc,C.green,  O(),15)
     local BallLbl  = InfoLbl(sc,C.blue,   O(),14)
     local TgtLbl   = InfoLbl(sc,C.purple, O(),14)
     local SpdLbl   = InfoLbl(sc,C.sub,    O(),14)
     local TtiLbl   = InfoLbl(sc,C.yellow, O(),14)
-    local CompLbl  = InfoLbl(sc,C.orange, O(),14)
 
     _G.__Z0M_UpdateMain = function()
         RefreshStatus()
@@ -1322,46 +1328,56 @@ do
         FpsLbl.TextColor3=fc
         FpsLbl.Text=string.format("FPS: %.0f  (raw %.0f)", smoothFPS, rawFPS)
 
-        local jitC2 = math.clamp(math.sqrt(dtVar)*3,0,0.04)
-        local fpsC2 = fpsLow and math.clamp((60-smoothFPS)/60*0.07,0,0.07) or 0
-        local anyC  = fpsC2>0.001 or jitC2>0.001 or spiking
-        CompLbl.Text = anyC
-            and string.format("⚠ +%.0fms ping +%.0fms fps +%.0fms jitter",
-                smoothPing/2, fpsC2*1000, jitC2*1000)
-            or "  Systems nominal"
-        CompLbl.TextColor3 = anyC and C.orange or C.sub
-
+        -- Threshold breakdown — uses GetThresholdComponents() so it ALWAYS
+        -- matches what the actual parry logic fires on. No separate recalculation.
+        local base, pingC, fpsC, jitC, aeroC = GetThresholdComponents()
+        local final = base + pingC + fpsC + jitC + aeroC
+        -- Apply dist floor if ball is active
         local ball = currentBall
+        local spd3 = ball and ball.Parent and ball:FindFirstChild("zoomies")
+                     and ball:FindFirstChild("zoomies").VectorVelocity.Magnitude or 0
+        if S.AutoTiming and spd3 > 0.5 then
+            final = math.max(final, math.min(S.MinFireDist/spd3, 2.0))
+        end
+
+        CompBase.Text  = string.format("  Base threshold:  %.0fms", base*1000)
+        CompBase.TextColor3 = C.sub
+        CompPing.TextColor3 = pingC>0.001 and C.cyan or C.sub
+        CompPing.Text  = string.format("  Ping comp:       +%.0fms", pingC*1000)
+        CompFps.TextColor3  = fpsC>0.001 and C.yellow or C.sub
+        CompFps.Text   = string.format("  FPS comp:        +%.0fms", fpsC*1000)
+        CompJit.TextColor3  = jitC>0.001 and C.orange or C.sub
+        CompJit.Text   = string.format("  Jitter comp:     +%.0fms", jitC*1000)
+        CompAero.TextColor3 = aeroC>0.001 and C.orange or C.sub
+        CompAero.Text  = aeroC>0.001
+            and string.format("  Aero boost:      +%.0fms  ⚡", aeroC*1000)
+            or  "  Aero boost:      —"
+        CompFin.TextColor3  = C.green
+        CompFin.Text   = string.format("  Final:           %.0fms", final*1000)
+
         if ball and ball.Parent then
             BallLbl.TextColor3=C.green; BallLbl.Text="✓ Ball: "..ball.Name
             local tgt2 = ball:GetAttribute("target") or "—"
             TgtLbl.TextColor3 = tgt2==LP.Name and C.red or C.sub
             TgtLbl.Text = "Target: "..tgt2..(tgt2==LP.Name and "  ← YOU" or "")
             local z = ball:FindFirstChild("zoomies")
-            local spd3 = z and z.VectorVelocity.Magnitude or 0
             local dist3 = cachedHRP and (cachedHRP.Position-ball.Position).Magnitude or 0
             SpdLbl.Text = string.format("Speed: %.0f u/s  dist: %.1f st", spd3, dist3)
             SpdLbl.TextColor3 = spd3>80 and C.red or spd3>40 and C.yellow or C.sub
             if cachedHRP and spd3>0.5 then
                 local tti3 = GetTTI(ball,cachedHRP,1/60)
-                local thr3 = GetThreshold()
-                if S.AutoTiming then thr3=math.max(thr3,math.min(S.MinFireDist/spd3,2.0)) end
                 TtiLbl.Text = tti3>=10 and "TTI: —"
-                    or string.format("TTI: %.3fs  (thr %.3fs)", tti3, thr3)
-                TtiLbl.TextColor3 = tti3<=thr3 and C.green or C.yellow
-                -- Update TTI bar (1.0 = far, 0.0 = at threshold)
-                local barRatio = tti3>=10 and 0 or math.clamp(tti3/math.max(thr3,0.01)/4, 0, 1)
-                local barFill  = math.clamp(1 - barRatio, 0, 1)
-                TTIBar.Size = UDim2.new(barFill,0,1,0)
-                TTIBar.BackgroundColor3 = tti3<=thr3 and C.green or (tti3<=thr3*2 and C.yellow or C.sub)
+                    or string.format("TTI: %.3fs  (thr %.3fs)", tti3, final)
+                TtiLbl.TextColor3 = tti3<=final and C.green or C.yellow
+                -- TTI bar: fills as ball gets closer; turns green at fire point
+                local barRatio = tti3>=10 and 0 or math.clamp(1 - tti3/(final*4), 0, 1)
+                TTIBar.Size = UDim2.new(barRatio,0,1,0)
+                TTIBar.BackgroundColor3 = tti3<=final and C.green or (tti3<=final*2 and C.yellow or C.sub)
             else
                 TtiLbl.Text="TTI: —"; TtiLbl.TextColor3=C.sub; TTIBar.Size=UDim2.new(0,0,1,0)
             end
             if S.AutoTiming and sliderRefs["TriggerTime"] then
-                local thr4=GetThreshold()
-                local spd4=(z and z.VectorVelocity.Magnitude or 0)
-                if S.AutoTiming and spd4>0.5 then thr4=math.max(thr4,math.min(S.MinFireDist/spd4,2.0)) end
-                sliderRefs["TriggerTime"](math.clamp(thr4,0.10,0.55))
+                sliderRefs["TriggerTime"](math.clamp(final,0.10,0.55))
             end
         else
             BallLbl.TextColor3=C.red; BallLbl.Text="✗ No ball"
@@ -1402,7 +1418,6 @@ do
     local sc=tabScrolls["Detect"]; local o=0; local function O() o=o+1; return o end
 
     Section(sc,"  ⚡  Aerodynamic Slash",O()); Div(sc,O())
-
     local ACard=Instance.new("Frame",sc)
     ACard.Size=UDim2.new(0.92,0,0,isMobile and 64 or 54)
     ACard.BackgroundColor3=C.panel; ACard.BorderSizePixel=0; ACard.LayoutOrder=O(); Corner(8,ACard)
@@ -1436,7 +1451,7 @@ do
         C.orange,O())
     MakeSlider(sc,"Boost (ms)","AeroBoost",10,200,"%.0f ms",nil,O())
     MakeSlider(sc,"Expire (s)","AeroDecay",0.3,3.0,"%.1f s",nil,O())
-    InfoLbl(sc,C.sub,O(),26).Text="  Boost: extra threshold added on detection.\n  Expire: seconds before detection resets."
+    InfoLbl(sc,C.sub,O(),26).Text="  Boost: extra ms added to threshold on detection.\n  Expire: seconds before detection auto-resets."
 
     Div(sc,O()); Section(sc,"  📡  Curve Detection",O())
     MakeToggle(sc,"Curve Detection",
@@ -1450,7 +1465,7 @@ do
         function() return S.AutoCurve end,
         function(v) S.AutoCurve=v; if not v then acPinTarget=nil end end,
         C.teal,O())
-    InfoLbl(sc,C.sub,O(),13).Text="  Snaps camera toward nearest enemy after parry."
+    InfoLbl(sc,C.sub,O(),13).Text="  After parrying, snaps camera toward nearest enemy."
     MakeSlider(sc,"Snap dur (s)","ACSnapDur",0.05,0.50,"%.2f",nil,O())
 
     Div(sc,O()); Section(sc,"  📌  Curve Target",O())
@@ -1490,14 +1505,15 @@ do
         function() return S.AntiCurve end,
         function(v) S.AntiCurve=v; if not v then antiActive=false end end,
         C.red,O())
-    InfoLbl(sc,C.sub,O(),13).Text="  Single-shot physics override on parry (zeroes ball spin)."
+    InfoLbl(sc,C.sub,O(),13).Text="  On parry: zeros angular velocity, forces straight line."
     MakeSlider(sc,"Duration (s)","AntiCurveDur",0.10,1.00,"%.2f",nil,O())
 
     Div(sc,O()); Section(sc,"  📊  Live",O())
     local AeroLive  = InfoLbl(sc,C.orange,O(),15)
     local CurveLive = InfoLbl(sc,C.purple,O(),14)
-    local ACLive    = InfoLbl(sc,C.red,   O(),14)
+    -- v3.2: Homing shows raw acceleration strength (u/s²), per spec
     local HomeLive  = InfoLbl(sc,C.sub,   O(),14)
+    local ACLive    = InfoLbl(sc,C.red,   O(),14)
 
     _G.__Z0M_UpdateDetect = function()
         RefAero(); RefPin()
@@ -1512,9 +1528,15 @@ do
             local curving=IsCurving()
             CurveLive.TextColor3=curving and C.purple or C.sub
             CurveLive.Text=string.format("ω=%.2f rad/s  %s",curveAngVel,curving and "CURVING" or "(straight)")
-            HomeLive.Text=string.format("Homing bias: %.0f%%",homingBias*100)
-            HomeLive.TextColor3=homingBias>0.5 and C.orange or C.sub
-        else CurveLive.Text="Curve: OFF"; CurveLive.TextColor3=C.sub; HomeLive.Text="" end
+            -- Homing strength: raw u/s² acceleration toward player
+            -- Per spec: velocity += target_direction * homing_strength
+            HomeLive.TextColor3 = homingAccel > 30 and C.orange or C.sub
+            HomeLive.Text = string.format("Homing strength: %.1f u/s²%s",
+                homingAccel, homingAccel>30 and "  ⚠" or "")
+        else
+            CurveLive.Text="Curve: OFF"; CurveLive.TextColor3=C.sub
+            HomeLive.Text="Homing: —"
+        end
 
         if S.AntiCurve then
             ACLive.TextColor3=antiActive and C.red or C.sub
@@ -1533,17 +1555,18 @@ do
         function() return S.PlayerESP end,
         function(v) S.PlayerESP=v; RebuildAllESP() end,
         C.yellow,O())
-    InfoLbl(sc,C.sub,O(),13).Text="  Names above heads. Red = shooting at you."
+    InfoLbl(sc,C.sub,O(),13).Text="  Names above heads. White = normal, Red = targeting you."
     MakeToggle(sc,"Ability ESP",
         function() return S.AbilityESP end,
         function(v) S.AbilityESP=v; RebuildAllESP() end,
         C.blue,O())
-    InfoLbl(sc,C.sub,O(),13).Text="  Scans all attributes for equipped ability."
+    InfoLbl(sc,C.sub,O(),13).Text="  Scans player/character/humanoid for equipped ability."
     Div(sc,O()); Section(sc,"  ✦  Character",O())
     MakeToggle(sc,"Character Trail",
         function() return S.CharTrail end,
         function(v) S.CharTrail=v; if LP.Character then ApplyTrail(LP.Character) end end,
         C.accent2,O())
+    InfoLbl(sc,C.sub,O(),13).Text="  Blue → purple fade trail. Cosmetic only."
     Div(sc,O()); Section(sc,"  🖥  Overlay",O())
     MakeToggle(sc,"CPS Counter",
         function() return S.ShowCPS end,
@@ -1674,7 +1697,6 @@ do
         NC.Size=UDim2.new(0.92,0,0,isMobile and 86 or 74); NC.BackgroundColor3=C.panel
         NC.BorderSizePixel=0; NC.LayoutOrder=o; o=o+1; Corner(8,NC)
         if isExp then Stroke(C.orange,1,NC).Transparency=0.5 end
-
         local TopRow=Instance.new("Frame",NC); TopRow.Size=UDim2.new(1,0,0,34); TopRow.BackgroundTransparency=1
         local Lbl=Instance.new("TextLabel",TopRow)
         Lbl.Size=UDim2.new(1,-58,1,0); Lbl.Position=UDim2.new(0,12,0,0)
@@ -1685,7 +1707,6 @@ do
         Trk2.BorderSizePixel=0; Corner(10,Trk2)
         local KP=Instance.new("Frame",Trk2); KP.Size=UDim2.new(0,13,0,13); KP.BorderSizePixel=0
         KP.BackgroundColor3=Color3.fromRGB(240,238,228); Corner(7,KP)
-
         local kSz2=isMobile and 20 or 13
         local ST=Instance.new("Frame",NC)
         ST.Size=UDim2.new(0.86,0,0,isMobile and 8 or 4); ST.Position=UDim2.new(0.07,0,1,-20)
@@ -1700,7 +1721,6 @@ do
         VL.Size=UDim2.new(1,-10,0,14); VL.Position=UDim2.new(0,12,0,34)
         VL.BackgroundTransparency=1; VL.Font=Enum.Font.Gotham; VL.TextSize=11
         VL.TextXAlignment=Enum.TextXAlignment.Left; VL.ZIndex=3
-
         local function SyncCPS()
             local active=(isExp==S.TBUseExp)
             Trk2.BackgroundColor3=active and onC or C.track
@@ -1709,13 +1729,11 @@ do
             VL.TextColor3=active and C.text or C.sub; VL.Text=string.format("%d CPS",S[key])
         end
         SyncCPS(); table.insert(_G.__Z0M_CpsSync,SyncCPS)
-
         local Hit2=Instance.new("TextButton",TopRow)
         Hit2.Size=UDim2.new(1,0,1,0); Hit2.BackgroundTransparency=1; Hit2.Text=""; Hit2.ZIndex=5
         Hit2.MouseButton1Click:Connect(function()
             S.TBUseExp=isExp; for _,f in ipairs(_G.__Z0M_CpsSync) do f() end
         end)
-
         local function CpsApply(sx)
             local w=ST.AbsoluteSize.X; if w==0 then return end
             local r=math.clamp((sx-ST.AbsolutePosition.X)/w,0,1)
@@ -1743,7 +1761,6 @@ end
 -- ═════════════════════════════ TAB: FPS ══
 do
     local sc=tabScrolls["FPS"]; local o=0; local function O() o=o+1; return o end
-
     local Banner=Instance.new("Frame",sc); Banner.Size=UDim2.new(0.92,0,0,52)
     Banner.BackgroundColor3=C.panel; Banner.BorderSizePixel=0; Banner.LayoutOrder=O(); Corner(8,Banner)
     local BanStroke=Stroke(C.lime,1,Banner); BanStroke.Transparency=0.4
@@ -1759,7 +1776,6 @@ do
     FGain.Size=UDim2.new(0.42,0,1,0); FGain.Position=UDim2.new(0.55,0,0,0)
     FGain.BackgroundTransparency=1; FGain.Font=Enum.Font.GothamBold; FGain.TextSize=13
     FGain.TextColor3=C.sub; FGain.TextXAlignment=Enum.TextXAlignment.Right; FGain.ZIndex=3; FGain.Text=""
-
     Div(sc,O())
     local BtnRow=Instance.new("Frame",sc)
     BtnRow.Size=UDim2.new(0.92,0,0,36); BtnRow.BackgroundTransparency=1; BtnRow.BorderSizePixel=0; BtnRow.LayoutOrder=O()
@@ -1772,14 +1788,11 @@ do
     local NukeBtn=FBtn("⚡ Nuke All",0,C.lime,Color3.fromRGB(0,0,0))
     local RestBtn=FBtn("↺ Restore",0.52,Color3.fromRGB(55,44,72),C.sub)
     NukeBtn.MouseButton1Click:Connect(function()
-        NukeAll(); NukeBtn.Text="✓ Done!"
-        task.delay(1.5,function() NukeBtn.Text="⚡ Nuke All" end)
+        NukeAll(); NukeBtn.Text="✓ Done!"; task.delay(1.5,function() NukeBtn.Text="⚡ Nuke All" end)
     end)
     RestBtn.MouseButton1Click:Connect(function()
-        RestoreAll(); fpsBaseline=0; RestBtn.Text="✓ Restored!"
-        task.delay(1.5,function() RestBtn.Text="↺ Restore" end)
+        RestoreAll(); fpsBaseline=0; RestBtn.Text="✓ Restored!"; task.delay(1.5,function() RestBtn.Text="↺ Restore" end)
     end)
-
     local fpsSyncs={}
     local function FPSTgl(lbl,note,key,col)
         local ord=O()
@@ -1793,18 +1806,16 @@ do
         fpsSyncs[key]=sync
         if note then InfoLbl(sc,C.sub,O(),13).Text="  "..note end
     end
-
     Div(sc,O()); Section(sc,"  🔆  Lighting",O())
-    FPSTgl("Disable Shadows",    "Biggest single gain on most hardware.",          "Shadows",     C.yellow)
-    FPSTgl("Disable Post-FX",    "Removes blur, depth-of-field, sun rays.",        "PostFX",      C.orange)
-    FPSTgl("Disable Fog",        "Removes distance fog entirely.",                 "Fog",         C.blue)
+    FPSTgl("Disable Shadows",    "Biggest single gain on most hardware.",     "Shadows",     C.yellow)
+    FPSTgl("Disable Post-FX",    "Blur, depth-of-field, sun rays.",           "PostFX",      C.orange)
+    FPSTgl("Disable Fog",        "Removes distance fog entirely.",            "Fog",         C.blue)
     Div(sc,O()); Section(sc,"  🌿  World",O())
-    FPSTgl("Disable Decorations","Removes terrain grass/leaf clutter.",            "Decorations", C.teal)
-    FPSTgl("Disable Particles",  "Hides all particles, fire, smoke, trails.",     "Particles",   C.orange)
-    FPSTgl("Disable Textures",   "Blanks mesh textures and decals.",              "Textures",    C.purple)
+    FPSTgl("Disable Decorations","Terrain grass/leaf clutter.",               "Decorations", C.teal)
+    FPSTgl("Disable Particles",  "All particles, fire, smoke, trails.",      "Particles",   C.orange)
+    FPSTgl("Disable Textures",   "Mesh textures and decals.",                "Textures",    C.purple)
     Div(sc,O()); Section(sc,"  ⚙  Engine",O())
-    FPSTgl("Minimum Quality",    "Forces QualityLevel 1 — most aggressive.",      "Quality",     C.red)
-
+    FPSTgl("Minimum Quality",    "Forces QualityLevel 1 — most aggressive.", "Quality",     C.red)
     _G.__Z0M_SyncFPS = function()
         for k,sync in pairs(fpsSyncs) do sync(FPS[k]) end
         local n=math.floor(smoothFPS); FNow.Text=tostring(n)
@@ -1829,7 +1840,6 @@ do
     InfoLbl(sc,C.sub,O(),14).Text="  SAVE → write  |  click name → LOAD  |  DEL → clear"
     Div(sc,O())
     local sNBtns={}; local sLbls={}
-
     local function RefSlot(i)
         local cfg=configs[i]; local btn=sNBtns[i]; local lbl=sLbls[i]; if not btn then return end
         if cfg and cfg.data then
@@ -1840,7 +1850,6 @@ do
             if lbl then lbl.Text="  Empty"; lbl.TextColor3=C.sub end
         end
     end
-
     for i=1,CONFIG_SLOTS do
         local SR=Instance.new("Frame",sc)
         SR.Size=UDim2.new(0.92,0,0,52); SR.BackgroundColor3=C.panel
@@ -1889,7 +1898,6 @@ do
             configs[i]={name="Slot "..i,data=nil}; SaveConfigs(); RefSlot(i)
         end)
     end
-
     Div(sc,O()); Section(sc,"  ⚡  Quick",O())
     local QS=Instance.new("TextButton",sc)
     QS.Size=UDim2.new(0.92,0,0,32); QS.BackgroundColor3=Color3.fromRGB(12,44,76)
@@ -1904,7 +1912,7 @@ end
 
 -- ═══════════════════════════════ CPS OVERLAY ══
 local CPSOv=Instance.new("Frame",ScreenGui)
-CPSOv.Name="Z0M_CPSOv"; CPSOv.Size=UDim2.new(0,168,0,56)
+CPSOv.Name="Z0M_CPSOv"; CPSOv.Size=UDim2.new(0,184,0,56)
 CPSOv.Position=isMobile and UDim2.new(0.5,-84,0,60) or UDim2.new(0.5,-84,0,12)
 CPSOv.BackgroundColor3=C.bg; CPSOv.BackgroundTransparency=0.06; CPSOv.BorderSizePixel=0
 CPSOv.Active=true; CPSOv.Visible=S.ShowCPS; CPSOv.ZIndex=20; Corner(10,CPSOv)
@@ -1991,23 +1999,23 @@ Con(UIS.InputEnded:Connect(function(i)
 end))
 
 -- ═══════════════════════════ LIVE GUI UPDATE ══
--- v3.1: slightly tighter 0.04s interval for more responsive live stats
 local guiT=0
 Con(RunService.Heartbeat:Connect(function(dt)
     guiT=guiT+dt; if guiT<0.04 then return end; guiT=0
-
     if _G.__Z0M_UpdateMain   then _G.__Z0M_UpdateMain()   end
     if _G.__Z0M_UpdateDetect then _G.__Z0M_UpdateDetect() end
     if _G.__Z0M_UpdateFPS    then _G.__Z0M_UpdateFPS()    end
-
     if S.ShowCPS and CPSOv.Visible then
         local tgt = S.TBUseExp and S.TBExpCps or S.TBCps
+        -- Per spec: always show both Target CPS and Actual CPS
+        -- Format: "actual  /  target  CPS"
         if tbActive then
-            CValLbl.Text=string.format("%d / %d CPS",cpsActual,tgt)
+            CValLbl.Text=string.format("%d / %d CPS", cpsActual, tgt)
             CValLbl.TextColor3=C.red; CTitleLbl.Text="CPS  (FIRING)"
         else
-            CValLbl.Text=string.format("%d CPS",tgt)
-            CValLbl.TextColor3=C.accent; CTitleLbl.Text="CPS COUNTER"
+            -- Actual is 0 when not firing; still display both per spec
+            CValLbl.Text=string.format("%d / %d CPS", cpsActual, tgt)
+            CValLbl.TextColor3=C.accent; CTitleLbl.Text="CPS  (IDLE)"
         end
         local fc=smoothFPS>=55 and C.green or smoothFPS>=35 and C.yellow or C.red
         CSubLbl.TextColor3=fc
@@ -2015,11 +2023,99 @@ Con(RunService.Heartbeat:Connect(function(dt)
     end
 end))
 
+-- ══════════════════════════════════════════ _G.Z0M API ══
+-- Exposed after full load so external scripts can call functions.
+-- Per spec: "Global Access — allows external scripts to interact with it."
+-- Example: _G.Z0M.ToggleAutoParry(false)
+--
+-- This replaces the pre-load settings table with a full API object.
+-- Settings injection is already handled above; this is the post-load API.
+_G.Z0M = {
+    -- Toggle Auto Parry on/off
+    ToggleAutoParry = function(on)
+        if type(on) ~= "boolean" then on = not S.AutoParry end
+        S.AutoParry = on
+        if _G.__Z0M_RefreshStatus then _G.__Z0M_RefreshStatus() end
+    end,
+
+    -- Toggle Triggerbot on/off
+    ToggleTriggerbot = function(on)
+        if not S.TBEnabled then return end
+        if type(on) ~= "boolean" then on = not tbActive end
+        if on then ActivateTB() else DeactivateTB() end
+    end,
+
+    -- Set any setting by key
+    -- Example: _G.Z0M.SetSetting("MinFireDist", 10)
+    SetSetting = function(key, value)
+        if S[key] == nil then return end
+        S[key] = value
+        if sliderRefs[key] then
+            sliderRefs[key](value)
+        end
+        if _G.__Z0M_RefreshStatus then _G.__Z0M_RefreshStatus() end
+    end,
+
+    -- Returns a shallow copy of all current settings
+    GetSettings = function()
+        local t = {}
+        for k, v in pairs(S) do t[k] = v end
+        return t
+    end,
+
+    -- FPS boost: nuke all or restore all
+    NukeFPS = function()
+        NukeAll()
+    end,
+    RestoreFPS = function()
+        RestoreAll()
+    end,
+
+    -- Open or close the menu
+    ShowMenu = function(visible)
+        if type(visible) ~= "boolean" then visible = not Main.Visible end
+        Main.Visible = visible
+    end,
+
+    -- Read-only live data for external use
+    GetLiveData = function()
+        local ball = currentBall
+        local z = ball and ball.Parent and ball:FindFirstChild("zoomies")
+        local base, pingC, fpsC, jitC, aeroC = GetThresholdComponents()
+        return {
+            parryState    = parryState,
+            autoParry     = S.AutoParry,
+            triggerbotOn  = tbActive,
+            ping          = displayPing,
+            fps           = smoothFPS,
+            cpsActual     = cpsActual,
+            ballExists    = ball ~= nil and ball.Parent ~= nil,
+            ballTarget    = ball and ball:GetAttribute("target") or nil,
+            ballSpeed     = z and z.VectorVelocity.Magnitude or 0,
+            thresholdBase = base,
+            thresholdPing = pingC,
+            thresholdFps  = fpsC,
+            thresholdJit  = jitC,
+            thresholdAero = aeroC,
+            thresholdFinal= base + pingC + fpsC + jitC + aeroC,
+            curveAngVel   = curveAngVel,
+            isCurving     = IsCurving(),
+            homingAccel   = homingAccel,
+            aeroDetected  = aeroDetected,
+        }
+    end,
+}
+
 -- ═══════════════════════════════════════ INIT ══
 SwitchTab("Main")
 RebuildAllESP()
 
-print(string.format("[z0mware v3.1] loaded  mobile=%s  ball=%s  players=%d",
+print(string.format("[z0mware v3.2] loaded  mobile=%s  ball=%s  players=%d",
     tostring(isMobile),
     currentBall and currentBall.Name or "waiting",
     #Players:GetPlayers()))
+print("[z0mware v3.2] API ready → _G.Z0M.ToggleAutoParry / ToggleTriggerbot / SetSetting / GetSettings / NukeFPS / RestoreFPS / ShowMenu / GetLiveData")
+
+-- Per spec: "Two globals are exposed: _G.Z0M and _G.Z0M_Settings"
+-- Both point to the same API object so either can be used interchangeably.
+_G.Z0M_Settings = _G.Z0M
