@@ -80,7 +80,34 @@ do
     }) do kill(v) end
 end
 
-
+-- ════════════════════════════════════ Settings ══
+local S = {
+    AutoParry        = true,
+    AutoTiming       = true,
+    ClashMode        = false,
+    TriggerTime      = 0.2355,
+    ClashDist        = 7.5,
+    MaxFires         = 1,          -- default 1; >1 is redundant with state machine but still works
+    CurveDetection   = true,
+    AutoCurve        = false,
+    AntiCurve        = true,
+    ACSnapDur        = 0.18,
+    AntiCurveDur     = 0.30,
+    PlayerNameESP    = false,
+    PlayerAbilityESP = false,
+    CharTrail        = true,
+    TBEnabled        = true,
+    TBMode           = "hold",
+    TBKey            = Enum.KeyCode.LeftAlt,
+    TBCps            = 60,
+    TBExpCps         = 500,
+    TBUseExp         = true,
+    ShowCPSCounter   = true,
+    MenuKey          = Enum.KeyCode.RightControl,
+    AeroDetect       = true,
+    AeroThreshBoost  = 60,
+    AeroDecay        = 1.2,
+}
 
 local _conns = {}
 local function Track(c) _conns[#_conns + 1] = c; return c end
