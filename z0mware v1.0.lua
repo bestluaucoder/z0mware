@@ -33,7 +33,10 @@ local LP         = Players.LocalPlayer
 local BallFolder = workspace:WaitForChild("Balls", 15)
 
 -- ══════════════════════════════════ Mobile detect ══
-local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+-- TouchEnabled is the only reliable mobile signal on Roblox.
+-- KeyboardEnabled is true even on phones (Roblox virtual keyboard), so we
+-- do NOT check it — that check made isMobile always false on real devices.
+local isMobile = UserInputService.TouchEnabled
 
 -- Kill old instances
 do
@@ -76,8 +79,43 @@ local S = {
     MenuKey        = Enum.KeyCode.RightControl,
 }
 
+-- Extra detection settings (added alongside S table)
+S.AeroDetect      = true   -- detect Aerodynamic Slash speed spikes
+S.AeroThreshBoost = 60     -- how much extra threshold (ms) to add when aero detected
+S.AeroDecay       = 1.2    -- seconds after which aero boost expires
+
 local _conns = {}
 local function Track(c) _conns[#_conns+1]=c; return c end
+
+-- ══════════════════════════════ AERO SLASH DETECTION ══
+-- Aerodynamic Slash causes a sudden sharp speed increase on the ball
+-- after a hit. We track the rolling max speed and flag a spike when
+-- current speed exceeds baselineMax * AeroSpikeMultiplier.
+-- While flagged, GetThreshold() adds AeroThreshBoost so we fire earlier.
+local aeroDetected     = false
+local aeroExpiry       = 0
+local aeroBaselineSpd  = 0   -- smoothed "normal" ball speed this round
+local aeroPeakSpd      = 0   -- highest observed speed this round
+local AERO_SPIKE_MULT  = 1.40 -- 40% faster than baseline = aero slash
+local aeroLastReset    = 0
+local function UpdateAero(ball)
+    if not S.AeroDetect then aeroDetected=false; return end
+    local z=ball:FindFirstChild("zoomies"); if not z then return end
+    local spd=z.VectorVelocity.Magnitude; if spd<2 then return end
+    local now=tick()
+    -- Slowly raise the baseline (tracks the "normal" speed of this ball)
+    aeroBaselineSpd=math.max(aeroBaselineSpd+0.08*(spd-aeroBaselineSpd), spd*0.6)
+    if spd>aeroPeakSpd then aeroPeakSpd=spd end
+    -- Spike check: speed jumped well above what we've seen as baseline
+    if aeroBaselineSpd>5 and spd >= aeroBaselineSpd*AERO_SPIKE_MULT then
+        aeroDetected=true; aeroExpiry=now+S.AeroDecay
+    end
+    -- Expire
+    if aeroDetected and now>=aeroExpiry then aeroDetected=false end
+end
+local function ResetAeroRound()
+    aeroDetected=false; aeroBaselineSpd=0; aeroPeakSpd=0; aeroExpiry=0
+end
 
 -- ══════════════════════════════════ FPS / Jitter ══
 local smoothFPS=60; local rawFPS=60; local fpsLow=false
@@ -110,7 +148,10 @@ local function GetThreshold()
     local pingC = math.clamp(smoothPing / 2000, 0, 0.04)
     local fpsC  = fpsLow and math.clamp((60-smoothFPS)/60*0.04, 0, 0.04) or 0
     local jitC  = math.clamp(math.sqrt(dtVar)*1.5, 0, 0.025)
-    return base + pingC + fpsC + jitC
+    -- When Aerodynamic Slash is detected the ball is faster, so we need
+    -- to fire earlier — add AeroThreshBoost on top of the base threshold.
+    local aeroC = (aeroDetected and S.AeroDetect) and S.AeroThreshBoost/1000 or 0
+    return base + pingC + fpsC + jitC + aeroC
 end
 
 -- ══════════════════════════════════ CURVE ENGINE ══
@@ -275,7 +316,7 @@ local function DisconnectBall()
 end
 local function BindBall(ball)
     if ballConn then ballConn:Disconnect(); ballConn=nil end
-    currentBall=ball; fireCount=0; inWindow=false; hasParried=false; lastParryTime=0; CurveClear()
+    currentBall=ball; fireCount=0; inWindow=false; hasParried=false; lastParryTime=0; CurveClear(); ResetAeroRound()
     if not ball then return end
     ballConn=ball:GetAttributeChangedSignal("target"):Connect(function()
         -- Real target change: fresh parry window, reset hasParried so we fire again
@@ -310,8 +351,9 @@ Track(LP.CharacterAdded:Connect(CacheCharacter))
 -- ══════════════════════════════════ MAIN LOOP ══
 Track(RunService.PreSimulation:Connect(function(dt)
     UpdatePing(); UpdateFPS(dt)
-    if S.CurveDetection and currentBall and currentBall.Parent then
-        CurveSample(currentBall); CurveAnalyse()
+    if currentBall and currentBall.Parent then
+        if S.CurveDetection then CurveSample(currentBall); CurveAnalyse() end
+        UpdateAero(currentBall)
     end
     cpsMeasTimer+=dt
     if cpsMeasTimer>=1 then cpsActual=cpsFireBucket; cpsFireBucket=0; cpsMeasTimer-=1 end
@@ -615,30 +657,30 @@ local _tSt=Instance.new("UIStroke",ToggleBtn)
 _tSt.Color=C.accent2; _tSt.Thickness=1.5; _tSt.Transparency=0.3
 
 do  -- draggable toggle btn
-    local dragging=false; local dragStart=nil; local startPos=nil; local moved=false
-    local function onStart(pos) dragging=true; dragStart=pos; startPos=ToggleBtn.Position; moved=false end
-    local function onMove(pos)
-        if not dragging then return end
-        local d=pos-dragStart; if d.Magnitude>6 then moved=true end
-        ToggleBtn.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
-    end
-    local function onEnd() dragging=false end
-    ToggleBtn.InputBegan:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then onStart(i.Position) end
+    local activeInput = nil
+    local dragStart, startPos
+    local moved = false
+    ToggleBtn.InputBegan:Connect(function(input)
+        if activeInput then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        activeInput = input; dragStart = input.Position; startPos = ToggleBtn.Position; moved = false
     end)
-    Track(UserInputService.InputChanged:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then onMove(i.Position) end
-    end))
-    Track(UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then onEnd() end
-    end))
-    -- FIX: Main is forward-declared above, so this closure is safe
+    ToggleBtn.InputChanged:Connect(function(input)
+        if input ~= activeInput then return end
+        local d = input.Position - dragStart
+        if d.Magnitude > 12 then moved = true end   -- 12px: above touch jitter, below intentional drag
+        ToggleBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+    end)
+    ToggleBtn.InputEnded:Connect(function(input)
+        if input == activeInput then activeInput = nil end
+    end)
     ToggleBtn.MouseButton1Click:Connect(function()
         if moved then return end
         if Main then
-            Main.Visible=not Main.Visible
-            TweenService:Create(ToggleBtn,TweenInfo.new(0.12),{
-                BackgroundColor3=Main.Visible and Color3.fromRGB(18,20,42) or Color3.fromRGB(10,11,20)
+            Main.Visible = not Main.Visible
+            TweenService:Create(ToggleBtn, TweenInfo.new(0.12), {
+                BackgroundColor3 = Main.Visible and Color3.fromRGB(18,20,42) or Color3.fromRGB(10,11,20)
             }):Play()
         end
     end)
@@ -681,23 +723,24 @@ if isMobile then
     _G.__Z0M_RefreshMobileTB=RefreshMobileTB
 
     do  -- draggable mobile TB btn
-        local dragging=false; local dragStart=nil; local startPos=nil; local moved=false
-        local function onStart(pos) dragging=true; dragStart=pos; startPos=MobileTBBtn.Position; moved=false end
-        local function onMove(pos)
-            if not dragging then return end
-            local d=pos-dragStart; if d.Magnitude>6 then moved=true end
-            MobileTBBtn.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
-        end
-        local function onEnd() dragging=false end
-        MobileTBBtn.InputBegan:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then onStart(i.Position) end
+        local activeInput = nil
+        local dragStart, startPos
+        local moved = false
+        MobileTBBtn.InputBegan:Connect(function(input)
+            if activeInput then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            activeInput = input; dragStart = input.Position; startPos = MobileTBBtn.Position; moved = false
         end)
-        Track(UserInputService.InputChanged:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then onMove(i.Position) end
-        end))
-        Track(UserInputService.InputEnded:Connect(function(i)
-            if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then onEnd() end
-        end))
+        MobileTBBtn.InputChanged:Connect(function(input)
+            if input ~= activeInput then return end
+            local d = input.Position - dragStart
+            if d.Magnitude > 12 then moved = true end
+            MobileTBBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+        end)
+        MobileTBBtn.InputEnded:Connect(function(input)
+            if input == activeInput then activeInput = nil end
+        end)
         MobileTBBtn.MouseButton1Click:Connect(function()
             if moved then return end
             if not S.TBEnabled then return end
@@ -764,24 +807,32 @@ _tbl.FillDirection=Enum.FillDirection.Horizontal; _tbl.HorizontalAlignment=Enum.
 _tbl.SortOrder=Enum.SortOrder.LayoutOrder
 
 -- ── Drag helper ──────────────────────────────────────────────────
-local function MakeDraggable(frame,handle)
-    handle=handle or frame
-    local dragging=false; local dragStart,startPos
-    local function begin(pos) dragging=true; dragStart=pos; startPos=frame.Position end
-    local function move(pos)
-        if not dragging then return end; local d=pos-dragStart
-        frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
-    end
-    local function finish() dragging=false end
-    handle.InputBegan:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then begin(i.Position) end
+local function MakeDraggable(frame, handle)
+    handle = handle or frame
+    local activeInput = nil
+    local dragStart, startPos
+    -- Use handle.InputChanged (fires ONLY for inputs that began on this element)
+    -- instead of global UserInputService.InputChanged (fires for ALL touches).
+    -- This prevents a second finger anywhere on screen from teleporting the window.
+    handle.InputBegan:Connect(function(input)
+        if activeInput then return end  -- ignore second finger
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        activeInput = input
+        dragStart   = input.Position
+        startPos    = frame.Position
     end)
-    Track(UserInputService.InputChanged:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then move(i.Position) end
-    end))
-    Track(UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then finish() end
-    end))
+    handle.InputChanged:Connect(function(input)
+        if input ~= activeInput then return end
+        local d = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end)
+    handle.InputEnded:Connect(function(input)
+        if input == activeInput then activeInput = nil end
+    end)
 end
 MakeDraggable(Main,Header)
 
@@ -826,41 +877,56 @@ local function MakeToggle(p,label,getV,setV,onColor,order,onChange)
 end
 
 local function MakeSlider(p,label,key,minV,maxV,fmt,lockWhen,order)
-    local h=isMobile and 60 or 52
+    local h=isMobile and 64 or 52
     local Row=Instance.new("Frame",p); Row.Size=UDim2.new(0.9,0,0,h); Row.BackgroundColor3=C.panel; Row.BorderSizePixel=0; Row.LayoutOrder=order
     Instance.new("UICorner",Row).CornerRadius=UDim.new(0,8)
     local Lbl=Instance.new("TextLabel",Row); Lbl.Size=UDim2.new(1,-10,0,22); Lbl.Position=UDim2.new(0,12,0,4); Lbl.BackgroundTransparency=1; Lbl.Font=Enum.Font.Gotham; Lbl.TextSize=11; Lbl.TextXAlignment=Enum.TextXAlignment.Left; Lbl.ZIndex=3
     local function Locked() return lockWhen and S[lockWhen] end
     local function UpdLbl(val) Lbl.TextColor3=Locked() and C.subtext or C.text; Lbl.Text=label..":  "..string.format(fmt,val)..(Locked() and "  [AUTO]" or "") end
     UpdLbl(S[key])
-    local trackH=isMobile and 8 or 5
-    local Tr=Instance.new("Frame",Row); Tr.Size=UDim2.new(0.86,0,0,trackH); Tr.Position=UDim2.new(0.07,0,1,-18); Tr.BackgroundColor3=C.track; Tr.BorderSizePixel=0; Instance.new("UICorner",Tr).CornerRadius=UDim.new(1,0)
+    local trackH=isMobile and 10 or 5
+    -- Tap hit area: full-width strip above track so finger doesn't need to be precise
+    local TrHit=Instance.new("TextButton",Row); TrHit.Size=UDim2.new(0.86,0,0,isMobile and 32 or 20); TrHit.Position=UDim2.new(0.07,0,1,isMobile and -36 or -26); TrHit.BackgroundTransparency=1; TrHit.Text=""; TrHit.ZIndex=6; TrHit.BorderSizePixel=0
+    local Tr=Instance.new("Frame",TrHit); Tr.Size=UDim2.new(1,0,0,trackH); Tr.Position=UDim2.new(0,0,1,-trackH); Tr.BackgroundColor3=C.track; Tr.BorderSizePixel=0; Instance.new("UICorner",Tr).CornerRadius=UDim.new(1,0)
     local iR=math.clamp((S[key]-minV)/(maxV-minV),0,1)
     local Fill=Instance.new("Frame",Tr); Fill.Size=UDim2.new(iR,0,1,0); Fill.BackgroundColor3=Locked() and C.subtext or C.accent; Fill.BorderSizePixel=0; Instance.new("UICorner",Fill).CornerRadius=UDim.new(1,0)
-    local kSize=isMobile and 22 or 14
-    local Knob=Instance.new("TextButton",Tr); Knob.Size=UDim2.new(0,kSize,0,kSize); Knob.Position=UDim2.new(iR,-kSize/2,0.5,-kSize/2); Knob.BackgroundColor3=Locked() and C.subtext or C.accent; Knob.BorderSizePixel=0; Knob.Text=""; Knob.ZIndex=5; Instance.new("UICorner",Knob).CornerRadius=UDim.new(1,0)
+    local kSize=isMobile and 24 or 14
+    local Knob=Instance.new("Frame",Tr); Knob.Size=UDim2.new(0,kSize,0,kSize); Knob.Position=UDim2.new(iR,-kSize/2,0.5,-kSize/2); Knob.BackgroundColor3=Locked() and C.subtext or C.accent; Knob.BorderSizePixel=0; Knob.ZIndex=5; Instance.new("UICorner",Knob).CornerRadius=UDim.new(1,0)
+
     local function SetVal(val)
         local r=math.clamp((val-minV)/(maxV-minV),0,1)
         Fill.Size=UDim2.new(r,0,1,0); Knob.Position=UDim2.new(r,-kSize/2,0.5,-kSize/2); UpdLbl(val)
         Fill.BackgroundColor3=Locked() and C.subtext or C.accent; Knob.BackgroundColor3=Locked() and C.subtext or C.accent
     end
     sliderRefs[key]=SetVal
-    local sliding=false
-    Knob.InputBegan:Connect(function(i)
-        if (i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch) and not Locked() then sliding=true end
-    end)
-    Track(UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then sliding=false end
-    end))
-    Track(UserInputService.InputChanged:Connect(function(i)
-        if not sliding then return end
-        if i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch then return end
-        if Locked() then sliding=false; return end
-        local w=Tr.AbsoluteSize.X; if w==0 then return end
-        local r=math.clamp((i.Position.X-Tr.AbsolutePosition.X)/w,0,1)
+
+    local slideInput=nil
+    local function applyPos(screenX)
+        local w=TrHit.AbsoluteSize.X; if w==0 then return end
+        local r=math.clamp((screenX-TrHit.AbsolutePosition.X)/w,0,1)
         S[key]=math.floor((minV+(maxV-minV)*r)*1000+0.5)/1000
         Fill.Size=UDim2.new(r,0,1,0); Knob.Position=UDim2.new(r,-kSize/2,0.5,-kSize/2); UpdLbl(S[key])
-    end))
+    end
+    local function onInputBegan(input)
+        if slideInput then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if Locked() then return end
+        slideInput = input
+        applyPos(input.Position.X)   -- snap to touch position immediately
+    end
+    local function onInputChanged(input)
+        if input ~= slideInput then return end
+        if Locked() then slideInput=nil; return end
+        applyPos(input.Position.X)
+    end
+    local function onInputEnded(input)
+        if input == slideInput then slideInput=nil end
+    end
+    -- Accept input from anywhere in the hit strip (includes the track and knob areas)
+    TrHit.InputBegan:Connect(onInputBegan)
+    TrHit.InputChanged:Connect(onInputChanged)
+    TrHit.InputEnded:Connect(onInputEnded)
 end
 
 local function MakeInfo(p,color,order,h)
@@ -882,7 +948,7 @@ local function MakeScroll()
     return sf
 end
 
-local TAB_NAMES={"Main","Curve","Visual","Triggerbot","FPS","Config"}
+local TAB_NAMES={"Main","Detect","Visual","Triggerbot","FPS","Config"}
 local tabScrolls={}; local tabBtns={}; local activeTab=nil
 
 local function SwitchTab(name)
@@ -1010,10 +1076,58 @@ do
     end)
 end
 
--- ════════════════════════════ CURVE TAB ══
+-- ════════════════════════════ DETECT TAB ══
 do
-    local sc=tabScrolls["Curve"]; local o=0; local function O() o+=1; return o end
-    MakeSection(sc,"  📡  Curve Detection",O()); MakeDivider(sc,O())
+    local sc=tabScrolls["Detect"]; local o=0; local function O() o+=1; return o end
+
+    -- ── Aerodynamic Slash ────────────────────────────────────────
+    MakeSection(sc,"  ⚡  Aerodynamic Slash",O()); MakeDivider(sc,O())
+
+    -- Status card
+    local AeroCard=Instance.new("Frame",sc)
+    AeroCard.Size=UDim2.new(0.9,0,0,isMobile and 68 or 56)
+    AeroCard.BackgroundColor3=C.panel; AeroCard.BorderSizePixel=0; AeroCard.LayoutOrder=O()
+    Instance.new("UICorner",AeroCard).CornerRadius=UDim.new(0,8)
+    local _aStroke=Instance.new("UIStroke",AeroCard); _aStroke.Thickness=1; _aStroke.Transparency=0.5
+    local AeroLbl=Instance.new("TextLabel",AeroCard)
+    AeroLbl.Size=UDim2.new(1,0,0.55,0); AeroLbl.Position=UDim2.new(0,0,0.1,0)
+    AeroLbl.BackgroundTransparency=1; AeroLbl.Font=Enum.Font.GothamBold
+    AeroLbl.TextSize=isMobile and 14 or 12; AeroLbl.TextXAlignment=Enum.TextXAlignment.Center; AeroLbl.ZIndex=3
+    local AeroSubLbl=Instance.new("TextLabel",AeroCard)
+    AeroSubLbl.Size=UDim2.new(1,0,0.38,0); AeroSubLbl.Position=UDim2.new(0,0,0.6,0)
+    AeroSubLbl.BackgroundTransparency=1; AeroSubLbl.Font=Enum.Font.Gotham
+    AeroSubLbl.TextSize=10; AeroSubLbl.TextXAlignment=Enum.TextXAlignment.Center
+    AeroSubLbl.TextColor3=C.subtext; AeroSubLbl.ZIndex=3
+
+    local function RefreshAeroCard()
+        if not S.AeroDetect then
+            AeroLbl.Text="○  AERO SLASH  DISABLED"; AeroLbl.TextColor3=C.subtext
+            _aStroke.Color=C.subtext; AeroSubLbl.Text="Enable below to detect speed spikes"
+        elseif aeroDetected then
+            AeroLbl.Text="⚡  AERO SLASH  DETECTED"; AeroLbl.TextColor3=C.orange
+            _aStroke.Color=C.orange
+            AeroSubLbl.Text=string.format("Threshold boosted +%.0fms  |  expires %.1fs",
+                S.AeroThreshBoost, math.max(0,aeroExpiry-tick()))
+        else
+            AeroLbl.Text="○  AERO SLASH  WATCHING"; AeroLbl.TextColor3=C.cyan
+            _aStroke.Color=C.cyan
+            AeroSubLbl.Text=string.format("Baseline: %.0f u/s  |  Peak: %.0f u/s",
+                aeroBaselineSpd, aeroPeakSpd)
+        end
+    end
+    RefreshAeroCard()
+
+    MakeToggle(sc,"Detect Aero Slash",function() return S.AeroDetect end,function(v)
+        S.AeroDetect=v; if not v then ResetAeroRound() end; RefreshAeroCard()
+    end,C.orange,O())
+    local an1=MakeInfo(sc,C.subtext,O(),26)
+    an1.Text="  Detects when enemy uses Aerodynamic Slash.\n  Raises threshold so you parry the faster ball."
+    MakeSlider(sc,"Boost (ms)","AeroThreshBoost",10,200,"%.0f ms",nil,O())
+    MakeSlider(sc,"Expire (s)","AeroDecay",0.3,3.0,"%.1f s",nil,O())
+    local an2=MakeInfo(sc,C.subtext,O(),26)
+    an2.Text="  Boost: extra threshold added on detection.\n  Expire: seconds before detection resets."
+
+    MakeDivider(sc,O()); MakeSection(sc,"  📡  Curve Detection",O())
     MakeToggle(sc,"Curve Detection",function() return S.CurveDetection end,function(v) S.CurveDetection=v; CurveClear() end,C.purple,O())
     local cdNote=MakeInfo(sc,C.subtext,O(),13); cdNote.Text="  Required by Auto Curve. Provides trajectory sampling."
     MakeDivider(sc,O()); MakeSection(sc,"  🔵  Auto Curve",O())
@@ -1042,14 +1156,33 @@ do
     local acN3=MakeInfo(sc,C.subtext,O(),13); acN3.Text="  After parrying, overrides ball physics each frame."
     local acN4=MakeInfo(sc,C.subtext,O(),13); acN4.Text="  Zeroes spin + forces straight-line velocity to target."
     MakeSlider(sc,"Duration (s)","AntiCurveDur",0.10,1.00,"%.2f",nil,O())
-    MakeDivider(sc,O()); MakeSection(sc,"  📊  Curve Status",O())
-    local CurveLbl=MakeInfo(sc,C.purple,O(),15); local ACLbl=MakeInfo(sc,C.red,O(),14); local HomingLbl=MakeInfo(sc,C.orange,O(),14)
+
+    MakeDivider(sc,O()); MakeSection(sc,"  📊  Live Status",O())
+    local AeroLiveLbl=MakeInfo(sc,C.orange,O(),16)
+    local CurveLbl=MakeInfo(sc,C.purple,O(),15)
+    local ACLbl=MakeInfo(sc,C.red,O(),14)
+    local HomingLbl=MakeInfo(sc,C.subtext,O(),14)
+
     _G.__Z0M_UpdateCurve=function()
+        RefreshAeroCard()
+        -- Aero live
+        if S.AeroDetect then
+            if aeroDetected then
+                AeroLiveLbl.TextColor3=C.orange
+                AeroLiveLbl.Text=string.format("⚡ AERO SLASH  +%.0fms  (%.1fs left)",S.AeroThreshBoost,math.max(0,aeroExpiry-tick()))
+            else
+                AeroLiveLbl.TextColor3=C.subtext
+                AeroLiveLbl.Text=string.format("Aero: watching  base %.0f  peak %.0f u/s",aeroBaselineSpd,aeroPeakSpd)
+            end
+        else AeroLiveLbl.TextColor3=C.subtext; AeroLiveLbl.Text="Aero detection: OFF" end
+        -- Curve live
         if S.CurveDetection then
             local curving=IsCurving()
-            CurveLbl.TextColor3=curving and C.purple or C.subtext; CurveLbl.Text=curving and string.format("ω = %.2f rad/s   CURVING",curveAngVel) or "Ball: straight path"
-            HomingLbl.Text=string.format("Homing bias: %.0f%%",curveHomingBias*100); HomingLbl.TextColor3=curveHomingBias>0.5 and C.orange or C.subtext
-        else CurveLbl.Text="Curve Detection: OFF"; CurveLbl.TextColor3=C.subtext; HomingLbl.Text="Homing bias: N/A"; HomingLbl.TextColor3=C.subtext end
+            CurveLbl.TextColor3=curving and C.purple or C.subtext
+            CurveLbl.Text=curving and string.format("ω = %.2f rad/s   CURVING",curveAngVel) or "Ball: straight path"
+            HomingLbl.Text=string.format("Homing bias: %.0f%%",curveHomingBias*100)
+            HomingLbl.TextColor3=curveHomingBias>0.5 and C.orange or C.subtext
+        else CurveLbl.Text="Curve Detection: OFF"; CurveLbl.TextColor3=C.subtext; HomingLbl.Text="Homing bias: N/A" end
         if S.AntiCurve then
             if antiCurveActive then ACLbl.TextColor3=C.red; ACLbl.Text=string.format("⬤ STRAIGHTENING  %.2fs left",math.max(0,antiCurveExpiry-tick()))
             else ACLbl.TextColor3=C.subtext; ACLbl.Text="○ Anti Curve armed — fires on next parry" end
@@ -1187,17 +1320,28 @@ do
         Refresh(); table.insert(_G.__Z0M_CpsRefresh,Refresh)
         local Hit=Instance.new("TextButton",TopRow); Hit.Size=UDim2.new(1,0,1,0); Hit.BackgroundTransparency=1; Hit.Text=""; Hit.ZIndex=5
         Hit.MouseButton1Click:Connect(function() S.TBUseExp=isExp; for _,f in ipairs(_G.__Z0M_CpsRefresh) do f() end end)
-        local sliding=false
-        SK.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then sliding=true end end)
-        Track(UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then sliding=false end end))
-        Track(UserInputService.InputChanged:Connect(function(i)
-            if not sliding then return end
-            if i.UserInputType~=Enum.UserInputType.MouseMovement and i.UserInputType~=Enum.UserInputType.Touch then return end
+        local slideInput=nil
+        local function cpsApply(screenX)
             local w=ST.AbsoluteSize.X; if w==0 then return end
-            local r=math.clamp((i.Position.X-ST.AbsolutePosition.X)/w,0,1)
-            S[key]=math.floor(minV+(maxV-minV)*r+0.5); F.Size=UDim2.new(r,0,1,0); SK.Position=UDim2.new(r,-kSz/2,0.5,-kSz/2)
+            local r=math.clamp((screenX-ST.AbsolutePosition.X)/w,0,1)
+            S[key]=math.floor(minV+(maxV-minV)*r+0.5)
+            F.Size=UDim2.new(r,0,1,0); SK.Position=UDim2.new(r,-kSz/2,0.5,-kSz/2)
             VL.Text=string.format("%d CPS  (target)",S[key])
-        end))
+        end
+        local function cpsBegin(input)
+            if slideInput then return end
+            if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
+            slideInput=input; cpsApply(input.Position.X)
+        end
+        local function cpsMove(input)
+            if input~=slideInput then return end; cpsApply(input.Position.X)
+        end
+        local function cpsEnd(input)
+            if input==slideInput then slideInput=nil end
+        end
+        -- Allow drag from anywhere on the track strip
+        ST.InputBegan:Connect(cpsBegin); ST.InputChanged:Connect(cpsMove); ST.InputEnded:Connect(cpsEnd)
+        SK.InputBegan:Connect(cpsBegin); SK.InputChanged:Connect(cpsMove); SK.InputEnded:Connect(cpsEnd)
     end
     MakeCPSBlock(sc,"Speed  (10 – 150 CPS)","TBCps",10,150,false)
     MakeDivider(sc,O())
