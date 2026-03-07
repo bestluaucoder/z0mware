@@ -43,39 +43,58 @@ local S = {
     AutoCurve    = false,
     ACSnapDur    = 0.18,
     AntiCurve    = true,
-    AntiCurveDur = 0.16,
-    AeroDetect   = false,
+    AntiCurveDur = 0.30,
+    AeroDetect   = true,
     AeroBoost    = 60,      -- ms added to threshold when Aero detected
     AeroDecay    = 1.2,     -- seconds before Aero detection resets
     -- Visual
-    PlayerESP    = true,
-    AbilityESP   = true,
+    PlayerESP    = false,
+    AbilityESP   = false,
     CharTrail    = true,
     ShowCPS      = true,
     -- Triggerbot
     TBEnabled    = true,
     TBMode       = "hold",  -- "hold" | "toggle"
     TBKey        = Enum.KeyCode.LeftAlt,
-    TBCps        = 122,
-    TBExpCps     = 172,
+    TBCps        = 60,
+    TBExpCps     = 469,
     TBUseExp     = true,
     -- System
     MenuKey      = Enum.KeyCode.RightControl,
 }
 
--- _G.Z0M settings injection (for loadstring usage)
-if type(_G.Z0M) == "table" then
-    for k, v in pairs(_G.Z0M) do
-        if S[k] ~= nil then S[k] = v end
-    end
-    for _, key in ipairs({"TBKey","MenuKey"}) do
-        local raw = _G.Z0M[key]
-        if raw then
-            local s = tostring(raw):gsub("Enum%.KeyCode%.","")
-            local ok, kc = pcall(function() return Enum.KeyCode[s] end)
-            if ok and kc then S[key] = kc end
+-- Settings injection from _G.
+-- All three of the following syntaxes work before loadstring():
+--
+--   (A)  S = { AutoParry=true, TBExpCps=172, ... }       ← drop "local"
+--   (B)  _G.Z0M = { AutoParry=true, TBExpCps=172, ... }  ← explicit _G
+--   (C)  _G.Z0M_Settings = { ... }                        ← legacy alias
+--
+-- NOTE: "local S" is scoped to the caller's chunk and is invisible inside
+-- loadstring(). Removing the word "local" makes S a global — which IS visible.
+-- Precedence (last wins per key): Z0M_Settings → Z0M → S
+do
+    local function ApplyTable(src)
+        if type(src) ~= "table" then return end
+        for k, v in pairs(src) do
+            if S[k] ~= nil then S[k] = v end
+        end
+        for _, key in ipairs({"TBKey","MenuKey"}) do
+            local raw = src[key]
+            if raw then
+                if typeof(raw) == "EnumItem" then
+                    S[key] = raw
+                else
+                    local stripped = tostring(raw):gsub("Enum%.KeyCode%.","")
+                    local ok, kc = pcall(function() return Enum.KeyCode[stripped] end)
+                    if ok and kc then S[key] = kc end
+                end
+            end
         end
     end
+    ApplyTable(_G.Z0M_Settings)
+    ApplyTable(_G.Z0M)
+    ApplyTable(_G.S)
 end
 
 -- ═══════════════════════════════════ GLOBAL INPUT STATE ══
